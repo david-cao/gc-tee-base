@@ -1,0 +1,11 @@
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=ipv4
+DNSDefaultRoute=yes
+
+[DHCPv4]
+# GCE serves MTU 1460 via DHCP; UseMTU is not on by default.
+UseMTU=true
+UseDomains=true

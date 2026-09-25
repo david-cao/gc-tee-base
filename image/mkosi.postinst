@@ -1,0 +1,26 @@
+#!/bin/sh
+# mkosi post-installation script. Runs on the build host with the image root
+# in $BUILDROOT; systemctl --root operates on the image offline.
+set -eu
+
+# Freeze PCR 11 at the systemd-stub-measured value: the systemd-pcr* units
+# would otherwise extend boot-phase strings into PCR 11 after the stub,
+# making the predicted golden value a moving target. Masking works whether or
+# not the unit exists.
+systemctl --root="$BUILDROOT" mask \
+    systemd-pcrphase.service \
+    systemd-pcrphase-sysinit.service \
+    systemd-pcrphase-initrd.service \
+    systemd-pcrmachine.service \
+    systemd-pcrfs-root.service \
+    systemd-pcrfs@.service \
+    systemd-pcrextend@.service \
+    systemd-pcrlock-make-policy.service
+
+systemctl --root="$BUILDROOT" enable \
+    systemd-networkd.service \
+    systemd-networkd-wait-online.service \
+    systemd-resolved.service \
+    systemd-timesyncd.service \
+    containerd.service \
+    gc-tee-launcher.service

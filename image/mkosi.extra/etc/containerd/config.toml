@@ -1,0 +1,5 @@
+# Minimal containerd configuration for the gc-tee launcher. State lives on
+# the writable /var partition; the rootfs is read-only.
+version = 2
+root = "/var/lib/containerd"
+state = "/run/containerd"

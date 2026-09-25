@@ -1,0 +1,19 @@
+# Example launch spec for the gc-tee-base launcher.
+#
+# Pin the image by digest: a tag would resolve at launch time and verifiers
+# should know the exact digest to expect (it is what the policy checks).
+image: docker.io/library/busybox@sha256:9ae97d36d26566ff84e8893c64a6dc4fe8ca6d1144bf5b87b2b85a32def253c7
+
+# Optional CMD override (docker semantics: image ENTRYPOINT is kept).
+cmd: ["sh", "-c", "echo hello from an attestable container; sleep 3600"]
+
+# Optional environment overrides, layered over the image environment.
+env:
+  GREETING: hello
+
+# Always | OnFailure | Never (default Never)
+restartPolicy: Never
+
+# Where the attestation evidence server listens (default 0.0.0.0:8080).
+# Evidence is public-verifiable; still remember GCE firewall rules apply.
+attestAddr: 0.0.0.0:8080

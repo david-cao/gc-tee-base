@@ -1,0 +1,20 @@
+[Unit]
+Description=gc-tee attestable container launcher
+Documentation=https://github.com/davidcao20/gc-tee-base
+After=network-online.target containerd.service systemd-timesyncd.service
+Wants=network-online.target
+Requires=containerd.service
+
+[Service]
+# Launch spec comes from GCE instance metadata (tee-image-reference, tee-cmd,
+# tee-env-*, tee-restart-policy). The workload restart policy is the
+# launcher's job; Restart= here only covers launcher failures (e.g. registry
+# unreachable at boot).
+ExecStart=/usr/bin/gc-tee-launcher -metadata
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

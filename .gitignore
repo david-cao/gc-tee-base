@@ -1,0 +1,6 @@
+/launcher
+/verifier
+evidence.pb
+/image/mkosi.extra/usr/bin/gc-tee-launcher
+/build-artifacts/
+/image/mkosi.output/

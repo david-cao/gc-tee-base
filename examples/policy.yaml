@@ -1,0 +1,36 @@
+# Example verifier policy for gc-tee-base.
+#
+# The verifier accepts evidence only if every check here passes, on top of the
+# built-in checks (Google CA chain, quote signature + nonce, TCG boot log
+# replay, canonical event log replay).
+
+# Required: the exact image manifest digest the workload must be running.
+imageDigest: sha256:9ae97d36d26566ff84e8893c64a6dc4fe8ca6d1144bf5b87b2b85a32def253c7
+
+# Optional: anchored regex the image reference must match.
+imageRefPattern: docker\.io/library/busybox@sha256:.*
+
+# Optional: env var names the operator may override (default: none).
+allowedEnvOverrides:
+  - GREETING
+
+# Optional: whether the operator may override the container command
+# (default false).
+allowArgOverrides: true
+
+# Optional: acceptable confidential technologies. Omit to skip the check
+# (which also accepts non-confidential VMs — set this in production).
+confidentialTechs:
+  - AMD_SEV
+  - AMD_SEV_SNP
+  - INTEL_TDX
+
+# Optional: require secure boot.
+requireSecureBoot: false
+
+# Optional: pin the evidence to one VM (values from the Google-issued AK
+# certificate). Empty fields are not checked.
+# gceInstance:
+#   projectId: my-project
+#   zone: us-central1-a
+#   instanceName: my-cvm
