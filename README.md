@@ -59,13 +59,19 @@ Confidential Space launcher, so claims are directly comparable.
 
 ## Deploying with the measured image (recommended)
 
-The [image/](image/README.md) tree builds a **measured Confidential VM
-image**: a minimal OS whose UKI (kernel + initrd + cmdline) is measured into
-PCR 4/11 and whose dm-verity root hash — sealed in the UKI cmdline — covers
-the read-only rootfs containing the launcher and containerd. Pinning PCR 4/11
-in the verifier policy therefore pins the exact launcher that performed the
-PCR 13 measurements, closing the unmeasured-userland gap of the stock-VM
-quickstart below.
+The [flake.nix](flake.nix) + [nix/](nix/README.md) tree builds a **measured,
+reproducible Confidential VM image** (NixOS appliance): a minimal OS whose
+UKI (kernel + initrd + cmdline) is measured into PCR 4/11 and whose dm-verity
+hash — sealed in the UKI cmdline as `usrhash=` — covers the read-only base
+layer containing the launcher and containerd. Pinning PCR 4/11 in the
+verifier policy therefore pins the exact launcher that performed the PCR 13
+measurements, closing the unmeasured-userland gap of the stock-VM quickstart
+below. Because every input is pinned by `flake.lock`, anyone can rebuild the
+bit-identical UKI at a commit and independently verify the published golden
+PCRs (see [nix/README.md](nix/README.md)).
+
+(The earlier mkosi-based image lives in [image/](image/README.md) and is
+kept until the NixOS image passes first-boot calibration.)
 
 ```bash
 # build the image on a throwaway GCE builder VM (~10 min), emit golden PCRs
@@ -80,8 +86,9 @@ go run ./cmd/verifier verify -host <IP>:8080 -policy examples/policy.yaml \
 ```
 
 First boot of a new image shape needs the one-time calibration runbook in
-[image/README.md](image/README.md) (confirms GCE boots the bare UKI and which
-PCR 4 event set the firmware produces). Secure boot stays off by design:
+[nix/README.md](nix/README.md) (confirms GCE boots the bare UKI, which PCR 4
+event set the firmware produces, and that the PCR 11 prediction matches the
+stub's section measurements). Secure boot stays off by design:
 `pcrs` pinning detects modified images, which for remote attestation is what
 matters.
 
