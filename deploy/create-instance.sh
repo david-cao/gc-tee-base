@@ -64,7 +64,7 @@ gcloud compute instances create "$NAME" \
   --shielded-vtpm \
   --shielded-integrity-monitoring \
   --no-shielded-secure-boot \
-  --nic-type=GVNIC \
+  --network-interface=nic-type=GVNIC \
   --metadata "$METADATA"
 
 IP=$(gcloud compute instances describe "$NAME" --zone "$ZONE" \

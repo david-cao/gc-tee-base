@@ -93,6 +93,13 @@ in
   services.resolved.enable = true;
   services.timesyncd.enable = true;
 
+  # NixOS's host firewall is on by default and would silently drop evidence
+  # requests. Open the attestation port (evidence is public-verifiable; GCE
+  # firewall rules still govern reachability). If tee-attest-addr moves the
+  # server off :8080, this list must follow — the port is baked into the
+  # measured image on purpose.
+  networking.firewall.allowedTCPPorts = [ 8080 ];
+
   ### Freeze PCR 11 at the stub-measured value. NixOS defaults already leave
   ### the pcrphase units disabled; disabling the tpm2 wiring and suppressing
   ### the units entirely is belt and braces so a nixpkgs bump cannot silently

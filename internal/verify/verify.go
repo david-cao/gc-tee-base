@@ -55,8 +55,10 @@ func Verify(att *attestpb.Attestation, opts Options) (*Result, error) {
 	if len(opts.TrustedAKs) > 0 {
 		vopts.TrustedAKs = opts.TrustedAKs
 	} else {
-		vopts.TrustedRootCerts = server.GceEKRoots
-		vopts.IntermediateCerts = server.GceEKIntermediates
+		// Not server.GceEKRoots: that exports the legacy EK root, which
+		// modern GCE AK certs do not chain to (see roots.go).
+		vopts.TrustedRootCerts = GceAKRoots
+		vopts.IntermediateCerts = GceAKIntermediates
 	}
 
 	machineState, err := server.VerifyAttestation(att, vopts)

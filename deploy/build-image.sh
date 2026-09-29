@@ -97,11 +97,24 @@ gcloud compute ssh "$BUILDER" --zone "$ZONE" --command "
   export PATH=\"/nix/var/nix/profiles/default/bin:\$PATH\"
   rm -rf ~/gc-tee-base && mkdir ~/gc-tee-base && tar -xzf ~/src.tar.gz -C ~/gc-tee-base
   cd ~/gc-tee-base
-  nix build .#image-${PROFILE} -o result-image -L
-  nix build .#uki-${PROFILE} -o result-uki -L
-  ls -la result-image/ result-uki/
+  # CRITICAL: out-links go OUTSIDE the source tree. The builder repo is a
+  # path flake (no .git), so an in-tree result symlink changes the source
+  # hash between the two nix build invocations — the image and the UKI would
+  # come from different evaluations and carry different usrhash/cmdlines.
+  rm -f ~/result-image ~/result-uki
+  nix build .#image-${PROFILE} -o ~/result-image -L
+  nix build .#uki-${PROFILE} -o ~/result-uki -L
+  ls -la ~/result-image/ ~/result-uki/
+  RAW=\$(ls ~/result-image/*.raw | head -1)
+  # Cross-check: the UKI inside the image's ESP must be byte-identical to
+  # the standalone UKI output we predict measurements from. Guards against
+  # the two nix invocations evaluating different sources.
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -qy mtools jq >/dev/null
+  ESP_START=\$(sfdisk -J \"\$RAW\" | jq -r '.partitiontable.partitions[] | select(.type | ascii_downcase | startswith(\"c12a7328\")) | .start')
+  mcopy -o -i \"\$RAW\"@@\$((ESP_START * 512)) ::/EFI/BOOT/BOOTX64.EFI /tmp/esp-uki.efi
+  cmp /tmp/esp-uki.efi ~/result-uki/*.efi
+  echo 'ESP UKI matches standalone UKI'
   # Package the disk for GCE: sparse tar named disk.raw, oldgnu format.
-  RAW=\$(ls result-image/*.raw | head -1)
   cp --sparse=always \"\$RAW\" disk.raw
   tar --format=oldgnu -Sczf image.tar.gz disk.raw
   # Upload via the metadata-token GCS JSON API (no gcloud needed on builder).
@@ -113,10 +126,11 @@ gcloud compute ssh "$BUILDER" --zone "$ZONE" --command "
     'https://storage.googleapis.com/upload/storage/v1/b/${BUCKET}/o?uploadType=media&name=${IMAGE_NAME}.tar.gz' \
     > /dev/null
   echo 'upload done'
-  # Stage artifacts for scp (result symlinks point into /nix/store).
-  mkdir -p ~/artifacts
-  cp result-uki/*.efi ~/artifacts/uki.efi 2>/dev/null || cp result-uki/* ~/artifacts/uki.efi
-  cp result-image/repart-output.json ~/artifacts/ 2>/dev/null || true
+  # Stage artifacts for scp (result symlinks point into /nix/store; files
+  # copied out are read-only, so clear leftovers from previous runs first).
+  mkdir -p ~/artifacts && rm -f ~/artifacts/*
+  install -m 0644 ~/result-uki/*.efi ~/artifacts/uki.efi
+  install -m 0644 ~/result-image/repart-output.json ~/artifacts/ 2>/dev/null || true
 "
 
 echo ">>> fetching artifacts (UKI, repart-output.json)"

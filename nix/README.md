@@ -96,11 +96,30 @@ Steps:
 
 ## Calibration results
 
-_(fill in after first boot)_
+Calibrated 2026-09-29 against `gc-tee-base-dev-20260929-174655` (SEV-SNP,
+us-central1-c, nixpkgs `cf5e765` / NixOS 26.05, systemd-stub from that pin).
+End-to-end `verifier verify -host ... -expected ...` → POLICY: PASS.
 
-- Date / image name / flake.lock nixpkgs rev:
-- Fallback-path UKI boot: —
-- PCR 4 variant confirmed: —
-- PCR 11 matched prediction (stub section set): —
-- Reproducibility double-build check: —
-- Notes: —
+- **Fallback-path UKI boot: works.** GCE firmware boots
+  `EFI/BOOT/BOOTX64.EFI` directly; verity store mounts; gVNIC DHCP +
+  MTU 1460, containerd, launcher all come up.
+- **PCR 4 variant: `uki-only`.** The firmware log is exactly EV_EFI_ACTION
+  ("Calling EFI Application from Boot Option"), EV_SEPARATOR, then one
+  EV_EFI_BOOT_SERVICES_APPLICATION whose digest is the standard PE
+  authentihash of the UKI. No event for the embedded kernel.
+- **PCR 11 rule (differs from uplosi's model, now implemented in
+  predict-measurements):** per recognized section in systemd-stub's fixed
+  order (`.linux .osrel .cmdline .initrd .uname .sbat` present in our UKI),
+  two events: sha256(**ASCII** section name + NUL), then sha256(section
+  content as loaded — raw data truncated/zero-padded to VirtualSize). The
+  event log's *data* field shows UTF-16 names, but the *digest* is over the
+  ASCII name.
+- **Pitfall (root-caused during calibration): predict from the image's ESP
+  UKI.** On the builder the repo is a path flake (no .git); an in-tree
+  `result-*` out-link changed the source hash between the image and UKI
+  builds, so the standalone UKI carried a different toplevel/usrhash in its
+  .cmdline than the image's. build-image.sh now uses out-of-tree out-links
+  and cmp-checks the ESP's BOOTX64.EFI against the standalone UKI.
+- Tamper check: predictions from the stale (mismatched) UKI correctly
+  produced POLICY: FAIL with the quoted-vs-expected values shown.
+- Reproducibility double-build check: — (pending)
