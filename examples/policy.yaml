@@ -1,16 +1,19 @@
 # Example verifier policy for gc-tee-base.
 #
-# The verifier accepts evidence only if every check here passes, on top of the
-# built-in checks (Google CA chain, quote signature + nonce, TCG boot log
-# replay, canonical event log replay).
+# The verifier accepts evidence only if every check here passes, on top of
+# the built-in checks (Google CA chain, quote signature + nonce, TCG boot
+# log replay, canonical event log replay against PCR 13).
 
-# Required: the exact image manifest digest the workload must be running.
-imageDigest: sha256:9ae97d36d26566ff84e8893c64a6dc4fe8ca6d1144bf5b87b2b85a32def253c7
+# REQUIRED: the exact manifest digest of the workload image — the sha256
+# after '@' in the reference you deploy. Obtain it from your registry, e.g.
+#   crane digest registry.example.com/myapp:v1
+# (see README "Getting your container's expected measurement").
+imageDigest: sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
 
 # Optional: anchored regex the image reference must match.
 imageRefPattern: docker\.io/library/busybox@sha256:.*
 
-# Optional: env var names the operator may override (default: none).
+# Optional: env var names the operator may override (default: none allowed).
 allowedEnvOverrides:
   - GREETING
 
@@ -18,15 +21,11 @@ allowedEnvOverrides:
 # (default false).
 allowArgOverrides: true
 
-# Optional: acceptable confidential technologies. Omit to skip the check
-# (which also accepts non-confidential VMs — set this in production).
+# Optional but recommended: acceptable confidential technologies
+# (AMD_SEV, AMD_SEV_ES, AMD_SEV_SNP, INTEL_TDX). Omitting this check also
+# accepts non-confidential VMs.
 confidentialTechs:
-  - AMD_SEV
   - AMD_SEV_SNP
-  - INTEL_TDX
-
-# Optional: require secure boot.
-requireSecureBoot: false
 
 # Optional: pin the evidence to one VM (values from the Google-issued AK
 # certificate). Empty fields are not checked.
@@ -34,3 +33,18 @@ requireSecureBoot: false
 #   projectId: my-project
 #   zone: us-central1-a
 #   instanceName: my-cvm
+
+# Base-image pinning (PCR 4 = UKI via firmware, PCR 11 = UKI sections via
+# systemd-stub; together they pin the exact launcher/OS that performed the
+# PCR 13 measurements). Prefer passing the build's artifact on the command
+# line instead of writing values here:
+#   verifier verify ... -expected build-artifacts/<image>/expected-measurements.json
+# pcrs:
+#   bank: sha256
+#   values:
+#     4: "<hex from expected-measurements.json>"
+#     11: "<hex from expected-measurements.json>"
+
+# requireSecureBoot exists but is not used with measured images: the UKI is
+# intentionally unsigned and PCR pinning covers strictly more.
+requireSecureBoot: false
