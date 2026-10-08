@@ -1,7 +1,8 @@
 // Package measure builds the canonical event log (CEL) of the workload's
-// identity and extends each event into vTPM PCR 13, following the same event
-// schema and ordering as the Confidential Space launcher so that verifier-side
-// parsing is compatible.
+// identity and extends each event into vTPM PCR 13. The log uses the same
+// TLV framing, PCR (13), and separator event as the Confidential Space
+// launcher, but records a single payload commitment instead of individual
+// claims: workload details stay private to whoever knows the payload.
 package measure
 
 import (
@@ -16,9 +17,13 @@ import (
 	"github.com/google/go-tpm-tools/client"
 	"github.com/google/go-tpm/legacy/tpm2"
 	"github.com/google/go-tpm/tpmutil"
-
-	"github.com/davidcao20/gc-tee-base/internal/spec"
 )
+
+// WorkloadCommitmentType is our CEL event type for the payload commitment:
+// sha256 over the exact plaintext bytes of the provisioned workload payload.
+// The value sits far above the Confidential Space event types (0..11) so the
+// logs remain structurally compatible but cannot be confused.
+const WorkloadCommitmentType tpmtoolscel.CosType = 128
 
 // ContainerClaims are the resolved, about-to-run properties of the workload.
 // All values must come from the same objects the runtime will execute, not
@@ -95,45 +100,19 @@ func (m *Measurer) extendLocked(content gecel.Content) error {
 	return m.cel.AppendEvent(content, m.hashAlgos, tpmtoolscel.CosEventPCR, m.extender())
 }
 
-// MeasureContainer records the workload identity in the upstream event order:
-// ImageRef, ImageDigest, RestartPolicy, ImageID, Args, EnvVars, OverrideEnvs,
-// OverrideArgs.
-func (m *Measurer) MeasureContainer(claims ContainerClaims, s *spec.LaunchSpec) error {
+// MeasureCommitment records the workload payload commitment (sha256 of the
+// exact payload plaintext) as the single pre-separator event. The commitment
+// — not the payload contents — becomes the public claim: a verifier who
+// knows the payload can check it; everyone else learns only a hash.
+func (m *Measurer) MeasureCommitment(commitment []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	type event struct {
-		t tpmtoolscel.CosType
-		v string
+	if len(commitment) != crypto.SHA256.Size() {
+		return fmt.Errorf("commitment must be %d bytes, got %d", crypto.SHA256.Size(), len(commitment))
 	}
-	events := []event{
-		{tpmtoolscel.ImageRefType, claims.ImageRef},
-		{tpmtoolscel.ImageDigestType, claims.ImageDigest},
-		{tpmtoolscel.RestartPolicyType, claims.RestartPolicy},
-		{tpmtoolscel.ImageIDType, claims.ImageID},
-	}
-	for _, arg := range claims.Args {
-		events = append(events, event{tpmtoolscel.ArgType, arg})
-	}
-	for _, env := range claims.EnvVars {
-		events = append(events, event{tpmtoolscel.EnvVarType, env})
-	}
-	for _, name := range s.SortedEnvNames() {
-		formatted, err := tpmtoolscel.FormatEnvVar(name, s.Envs[name])
-		if err != nil {
-			return fmt.Errorf("formatting override env var %q: %w", name, err)
-		}
-		events = append(events, event{tpmtoolscel.OverrideEnvType, formatted})
-	}
-	for _, arg := range s.Cmd {
-		events = append(events, event{tpmtoolscel.OverrideArgType, arg})
-	}
-
-	for _, e := range events {
-		tlv := tpmtoolscel.CosTlv{EventType: e.t, EventContent: []byte(e.v)}
-		if err := m.extendLocked(tlv); err != nil {
-			return fmt.Errorf("measuring event type %d: %w", e.t, err)
-		}
+	tlv := tpmtoolscel.CosTlv{EventType: WorkloadCommitmentType, EventContent: commitment}
+	if err := m.extendLocked(tlv); err != nil {
+		return fmt.Errorf("measuring workload commitment: %w", err)
 	}
 	return nil
 }

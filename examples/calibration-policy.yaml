@@ -1,7 +1,9 @@
 # Calibration policy: busybox hello-world workload on the measured dev image.
-# PCR pinning comes from -expected on the verifier command line.
-imageDigest: sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
-imageRefPattern: docker\.io/library/busybox@sha256:.*
-allowArgOverrides: true
+# PCR pinning comes from -expected on the verifier command line; the
+# workload commitment comes from the provisioning receipt (-receipt).
 confidentialTechs:
   - AMD_SEV_SNP
+hardware:
+  require: true
+  snp:
+    productLine: Milan

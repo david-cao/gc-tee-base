@@ -2,30 +2,51 @@
 #
 # The verifier accepts evidence only if every check here passes, on top of
 # the built-in checks (Google CA chain, quote signature + nonce, TCG boot
-# log replay, canonical event log replay against PCR 13).
+# log replay, canonical event log replay against PCR 13, and — when a
+# hardware report is present — its AMD cert chain and REPORT_DATA binding).
+#
+# The same file serves both stages: `verifier provision` evaluates only the
+# platform checks (everything except workloadCommitment) against a fresh
+# VM; `verifier verify` evaluates all of it against the running VM.
 
-# REQUIRED: the exact manifest digest of the workload image — the sha256
-# after '@' in the reference you deploy. Obtain it from your registry, e.g.
-#   crane digest registry.example.com/myapp:v1
-# (see README "Getting your container's expected measurement").
-imageDigest: sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
-
-# Optional: anchored regex the image reference must match.
-imageRefPattern: docker\.io/library/busybox@sha256:.*
-
-# Optional: env var names the operator may override (default: none allowed).
-allowedEnvOverrides:
-  - GREETING
-
-# Optional: whether the operator may override the container command
-# (default false).
-allowArgOverrides: true
+# The workload commitment: sha256 of the exact payload bytes that were
+# provisioned. Normally you do NOT write it here — `verifier verify` takes
+# it from the provisioning receipt (-receipt) or -commitment. Set it in the
+# file only for a fixed, standalone policy.
+# workloadCommitment: <hex from the receipt>
 
 # Optional but recommended: acceptable confidential technologies
-# (AMD_SEV, AMD_SEV_ES, AMD_SEV_SNP, INTEL_TDX). Omitting this check also
-# accepts non-confidential VMs.
+# (INTEL_TDX, AMD_SEV_SNP, AMD_SEV_ES, AMD_SEV) as asserted by the
+# Google-attested boot log. Omitting this check also accepts
+# non-confidential VMs. This is the Google-rooted claim; the
+# hardware-rooted claim is `hardware` below.
 confidentialTechs:
-  - AMD_SEV_SNP
+  - INTEL_TDX
+
+# Hardware attestation report (the Intel/AMD-rooted part of the chain).
+# A present report is always fully verified (signature chain to the vendor
+# root, REPORT_DATA binding, debug forbidden) — `require` decides whether
+# absence fails. The technology blocks you configure (tdx/snp) are the
+# accepted set: a tdx-only policy rejects SNP evidence and vice versa.
+hardware:
+  require: true
+  tdx:
+    # Optional: pin MRTD (96 hex chars) — the launch measurement of
+    # Google's TD firmware. Obtain it from a calibration run or Google's
+    # signed endorsement (gs://gce_tcb_integrity; see README).
+    # mrTd: <96 hex chars>
+    # Optional: pin RTMRs. RTMR[2] is the Intel-rooted pin of the exact
+    # base image (UKI section fold, sha384) — normally filled from the
+    # build via -expected rather than written here.
+    # rtmrs:
+    #   2: <96 hex chars>
+  # For SEV-SNP instances instead:
+  # snp:
+  #   # CPU product line, selects AMD's root certs when the report does
+  #   # not identify the product itself (GCE n2d = Milan).
+  #   productLine: Milan
+  #   # Optional golden launch measurement of Google's UEFI (96 hex).
+  #   # measurement: <96 hex chars>
 
 # Optional: pin the evidence to one VM (values from the Google-issued AK
 # certificate). Empty fields are not checked.
@@ -35,10 +56,10 @@ confidentialTechs:
 #   instanceName: my-cvm
 
 # Base-image pinning (PCR 4 = UKI via firmware, PCR 11 = UKI sections via
-# systemd-stub; together they pin the exact launcher/OS that performed the
-# PCR 13 measurements). Prefer passing the build's artifact on the command
+# systemd-stub; together they pin the exact launcher/OS that measured the
+# workload commitment). Prefer passing the build's artifact on the command
 # line instead of writing values here:
-#   verifier verify ... -expected build-artifacts/<image>/expected-measurements.json
+#   verifier provision|verify ... -expected build-artifacts/<image>/expected-measurements.json
 # pcrs:
 #   bank: sha256
 #   values:

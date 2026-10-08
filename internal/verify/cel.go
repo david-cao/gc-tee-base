@@ -9,6 +9,7 @@ package verify
 import (
 	"bytes"
 	"crypto"
+	"encoding/hex"
 	"fmt"
 	"sort"
 
@@ -21,20 +22,24 @@ import (
 	"github.com/google/go-tpm/legacy/tpm2"
 
 	attestpb "github.com/google/go-tpm-tools/proto/attest"
+
+	"github.com/davidcao20/gc-tee-base/internal/measure"
 )
 
-// Claims is the container identity extracted from a successfully replayed
+// Claims is the workload state extracted from a successfully replayed
 // canonical event log. Every field was verified against the vTPM quote.
+//
+// The log carries a commitment (hash of the exact payload plaintext), not
+// the workload details themselves: whoever knows the payload can check the
+// commitment; everyone else learns only that *some* committed payload runs.
 type Claims struct {
-	ImageRef          string            `json:"imageRef"`
-	ImageDigest       string            `json:"imageDigest"`
-	ImageID           string            `json:"imageID"`
-	RestartPolicy     string            `json:"restartPolicy"`
-	Args              []string          `json:"args"`
-	EnvVars           map[string]string `json:"envVars"`
-	OverriddenArgs    []string          `json:"overriddenArgs"`
-	OverriddenEnvVars map[string]string `json:"overriddenEnvVars"`
-	SeparatorSeen     bool              `json:"separatorSeen"`
+	// Provisioned is false for a fresh base layer: empty event log, PCR 13
+	// still zero, no workload accepted yet.
+	Provisioned bool `json:"provisioned"`
+	// WorkloadCommitment is the hex sha256 of the provisioned payload bytes.
+	WorkloadCommitment string `json:"workloadCommitment,omitempty"`
+	// SeparatorSeen means measurement was sealed before launch.
+	SeparatorSeen bool `json:"separatorSeen"`
 }
 
 // quotePreference orders PCR banks from most to least preferred for CEL
@@ -51,7 +56,9 @@ var quotePreference = []tpm2.Algorithm{
 // self-contained: the returned claims are trustworthy iff akPub is.
 func VerifiedClaims(att *attestpb.Attestation, akPub crypto.PublicKey, nonce []byte) (*Claims, error) {
 	if len(att.GetCanonicalEventLog()) == 0 {
-		return nil, fmt.Errorf("attestation has no canonical event log")
+		// Fresh base layer: nothing measured yet. The unprovisioned state is
+		// confirmed by the PCR 13 zero check (see VerifyUnprovisioned).
+		return &Claims{Provisioned: false}, nil
 	}
 
 	q, err := chooseQuote(att.GetQuotes())
@@ -114,13 +121,10 @@ func PCRBankFromProto(pcrs *tpmpb.PCRs) (register.PCRBank, error) {
 // claimsFromCEL walks the replayed records and folds them into Claims. Any
 // record we do not fully understand is an error: since unknown content cannot
 // be interpreted, accepting it would let unmeasured semantics hide in the log.
+// A well-formed log is exactly one WorkloadCommitment followed by the
+// LaunchSeparator.
 func claimsFromCEL(decoded gecel.CEL) (*Claims, error) {
-	claims := &Claims{
-		Args:              []string{},
-		EnvVars:           map[string]string{},
-		OverriddenArgs:    []string{},
-		OverriddenEnvVars: map[string]string{},
-	}
+	claims := &Claims{Provisioned: true}
 
 	for _, record := range decoded.Records() {
 		if record.IndexType != gecel.PCRType {
@@ -145,52 +149,24 @@ func claimsFromCEL(decoded gecel.CEL) (*Claims, error) {
 			return nil, fmt.Errorf("found COS event type %v after LaunchSeparator event", cosTlv.EventType)
 		}
 
-		content := string(cosTlv.EventContent)
 		switch cosTlv.EventType {
-		case tpmtoolscel.ImageRefType:
-			if claims.ImageRef != "" {
-				return nil, fmt.Errorf("found more than one ImageRef event")
+		case measure.WorkloadCommitmentType:
+			if claims.WorkloadCommitment != "" {
+				return nil, fmt.Errorf("found more than one WorkloadCommitment event")
 			}
-			claims.ImageRef = content
-		case tpmtoolscel.ImageDigestType:
-			if claims.ImageDigest != "" {
-				return nil, fmt.Errorf("found more than one ImageDigest event")
+			if len(cosTlv.EventContent) != crypto.SHA256.Size() {
+				return nil, fmt.Errorf("WorkloadCommitment event has %d bytes, want %d",
+					len(cosTlv.EventContent), crypto.SHA256.Size())
 			}
-			claims.ImageDigest = content
-		case tpmtoolscel.ImageIDType:
-			if claims.ImageID != "" {
-				return nil, fmt.Errorf("found more than one ImageID event")
-			}
-			claims.ImageID = content
-		case tpmtoolscel.RestartPolicyType:
-			if _, ok := attestpb.RestartPolicy_value[content]; !ok {
-				return nil, fmt.Errorf("unknown restart policy in CEL: %q", content)
-			}
-			if claims.RestartPolicy != "" {
-				return nil, fmt.Errorf("found more than one RestartPolicy event")
-			}
-			claims.RestartPolicy = content
-		case tpmtoolscel.ArgType:
-			claims.Args = append(claims.Args, content)
-		case tpmtoolscel.EnvVarType:
-			name, value, err := tpmtoolscel.ParseEnvVar(content)
-			if err != nil {
-				return nil, fmt.Errorf("parsing EnvVar event: %w", err)
-			}
-			claims.EnvVars[name] = value
-		case tpmtoolscel.OverrideArgType:
-			claims.OverriddenArgs = append(claims.OverriddenArgs, content)
-		case tpmtoolscel.OverrideEnvType:
-			name, value, err := tpmtoolscel.ParseEnvVar(content)
-			if err != nil {
-				return nil, fmt.Errorf("parsing OverrideEnv event: %w", err)
-			}
-			claims.OverriddenEnvVars[name] = value
+			claims.WorkloadCommitment = hex.EncodeToString(cosTlv.EventContent)
 		case tpmtoolscel.LaunchSeparatorType:
 			claims.SeparatorSeen = true
 		default:
 			return nil, fmt.Errorf("found unsupported COS event type %v", cosTlv.EventType)
 		}
+	}
+	if claims.WorkloadCommitment == "" {
+		return nil, fmt.Errorf("event log has no WorkloadCommitment event")
 	}
 	return claims, nil
 }

@@ -5,16 +5,15 @@
 
 buildGoModule {
   pname = "gc-tee-launcher";
-  version = "0.1.0";
+  version = "0.2.0";
 
   src = gcTeeSrc;
   subPackages = [ "cmd/launcher" ];
 
-  # Update workflow: whenever go.mod/go.sum change, set this to lib.fakeHash,
-  # build once, and copy the "got: sha256-..." value from the error here.
-  # (Precomputed via `go mod vendor` + `nix hash path`; if the first build
-  # reports a mismatch, trust the build's "got:" value.)
-  vendorHash = "sha256-oLzAGCd0XzS6o6U0yYJSJ/oby6aakaj+v+NbWurFnWo=";
+  # Update workflow: whenever go.mod/go.sum or the import graph change, set
+  # this to lib.fakeHash, run `nix build .#launcher` (works on any system,
+  # including macOS), and copy the "got: sha256-..." value from the error.
+  vendorHash = "sha256-foB+MAyIWi6fRwwZydwysMv6qh9xg+GUIkXsnUi/NPw=";
 
   env.CGO_ENABLED = "0";
 

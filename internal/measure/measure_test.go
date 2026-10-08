@@ -4,6 +4,7 @@ package measure_test
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"testing"
 
 	gecel "github.com/google/go-eventlog/cel"
@@ -14,28 +15,12 @@ import (
 	tpmtoolscel "github.com/google/go-tpm-tools/cel"
 
 	"github.com/davidcao20/gc-tee-base/internal/measure"
-	"github.com/davidcao20/gc-tee-base/internal/spec"
 	"github.com/davidcao20/gc-tee-base/internal/verify"
 )
 
-func testClaims() measure.ContainerClaims {
-	return measure.ContainerClaims{
-		ImageRef:      "docker.io/library/busybox:latest",
-		ImageDigest:   "sha256:aaaa",
-		ImageID:       "sha256:bbbb",
-		Args:          []string{"sh", "-c", "echo hi"},
-		EnvVars:       []string{"PATH=/bin"},
-		RestartPolicy: spec.RestartNever,
-	}
-}
-
-func testSpec() *spec.LaunchSpec {
-	s := &spec.LaunchSpec{
-		ImageRef: "docker.io/library/busybox:latest",
-		Envs:     map[string]string{"FOO": "bar"},
-	}
-	s.ApplyDefaults()
-	return s
+func testCommitment() []byte {
+	sum := sha256.Sum256([]byte(`{"image":"docker.io/library/busybox:latest","salt":"..."}`))
+	return sum[:]
 }
 
 func TestMeasureAndReplayAgainstTPM(t *testing.T) {
@@ -46,7 +31,7 @@ func TestMeasureAndReplayAgainstTPM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.MeasureContainer(testClaims(), testSpec()); err != nil {
+	if err := m.MeasureCommitment(testCommitment()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.Seal(); err != nil {
@@ -78,9 +63,22 @@ func TestMeasureAndReplayAgainstTPM(t *testing.T) {
 		t.Fatalf("Replay against TPM PCRs: %v", err)
 	}
 
-	// 4 scalar events + 3 args + 1 env + 1 override env + 1 separator = 10
-	if got := m.RecordCount(); got != 10 {
-		t.Errorf("RecordCount = %d, want 10", got)
+	// 1 commitment + 1 separator = 2
+	if got := m.RecordCount(); got != 2 {
+		t.Errorf("RecordCount = %d, want 2", got)
+	}
+}
+
+func TestMeasureCommitmentRejectsWrongSize(t *testing.T) {
+	tpm := testutil.GetTPM(t)
+	defer client.CheckedClose(t, tpm)
+
+	m, err := measure.New(tpm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.MeasureCommitment([]byte("too short")); err == nil {
+		t.Error("undersized commitment accepted, want error")
 	}
 }
 
@@ -99,7 +97,7 @@ func TestExtendAfterSealFails(t *testing.T) {
 	if err := m.Extend(tlv); err == nil {
 		t.Error("Extend after Seal succeeded, want error")
 	}
-	if err := m.MeasureContainer(testClaims(), testSpec()); err == nil {
-		t.Error("MeasureContainer after Seal succeeded, want error")
+	if err := m.MeasureCommitment(testCommitment()); err == nil {
+		t.Error("MeasureCommitment after Seal succeeded, want error")
 	}
 }

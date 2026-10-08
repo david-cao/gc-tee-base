@@ -1,0 +1,9 @@
+# TDX calibration policy: busybox hello-world workload on the measured dev
+# image, on a c3 Intel TDX instance. PCR pinning comes from -expected on the
+# verifier command line; the workload commitment comes from the receipt.
+# After calibration, pin mrTd and rtmrs here (see nix/README.md).
+confidentialTechs:
+  - INTEL_TDX
+hardware:
+  require: true
+  tdx: {}

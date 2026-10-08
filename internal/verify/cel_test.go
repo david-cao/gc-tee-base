@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/sha256"
+	"encoding/hex"
 	"reflect"
 	"testing"
 
@@ -12,6 +13,8 @@ import (
 	"github.com/google/go-eventlog/register"
 	tpmtoolscel "github.com/google/go-tpm-tools/cel"
 	"github.com/google/go-tpm/legacy/tpm2"
+
+	"github.com/davidcao20/gc-tee-base/internal/measure"
 )
 
 // softPCRs simulates a SHA-256 PCR bank in software.
@@ -40,28 +43,22 @@ func (s *softPCRs) bank() register.PCRBank {
 	return bank
 }
 
-func appendCos(t *testing.T, c gecel.CEL, soft *softPCRs, pcr int, typ tpmtoolscel.CosType, content string) {
+func appendCos(t *testing.T, c gecel.CEL, soft *softPCRs, pcr int, typ tpmtoolscel.CosType, content []byte) {
 	t.Helper()
-	tlv := tpmtoolscel.CosTlv{EventType: typ, EventContent: []byte(content)}
+	tlv := tpmtoolscel.CosTlv{EventType: typ, EventContent: content}
 	if err := c.AppendEvent(tlv, []crypto.Hash{crypto.SHA256}, pcr, soft.extender); err != nil {
-		t.Fatalf("AppendEvent(%v, %q): %v", typ, content, err)
+		t.Fatalf("AppendEvent(%v): %v", typ, err)
 	}
 }
+
+var testCommitment = bytes.Repeat([]byte{0xab}, sha256.Size)
 
 func buildStandardCEL(t *testing.T, soft *softPCRs) gecel.CEL {
 	t.Helper()
 	c := gecel.NewPCR()
 	pcr := tpmtoolscel.CosEventPCR
-	appendCos(t, c, soft, pcr, tpmtoolscel.ImageRefType, "docker.io/library/busybox:latest")
-	appendCos(t, c, soft, pcr, tpmtoolscel.ImageDigestType, "sha256:aaaa")
-	appendCos(t, c, soft, pcr, tpmtoolscel.RestartPolicyType, "Never")
-	appendCos(t, c, soft, pcr, tpmtoolscel.ImageIDType, "sha256:bbbb")
-	appendCos(t, c, soft, pcr, tpmtoolscel.ArgType, "sh")
-	appendCos(t, c, soft, pcr, tpmtoolscel.ArgType, "-c")
-	appendCos(t, c, soft, pcr, tpmtoolscel.EnvVarType, "PATH=/bin")
-	appendCos(t, c, soft, pcr, tpmtoolscel.OverrideEnvType, "FOO=bar")
-	appendCos(t, c, soft, pcr, tpmtoolscel.OverrideArgType, "-c")
-	appendCos(t, c, soft, pcr, tpmtoolscel.LaunchSeparatorType, "")
+	appendCos(t, c, soft, pcr, measure.WorkloadCommitmentType, testCommitment)
+	appendCos(t, c, soft, pcr, tpmtoolscel.LaunchSeparatorType, nil)
 	return c
 }
 
@@ -90,29 +87,11 @@ func TestClaimsRoundtrip(t *testing.T) {
 		t.Fatalf("claimsFromCEL: %v", err)
 	}
 
-	if claims.ImageRef != "docker.io/library/busybox:latest" {
-		t.Errorf("ImageRef = %q", claims.ImageRef)
+	if !claims.Provisioned {
+		t.Error("Provisioned = false")
 	}
-	if claims.ImageDigest != "sha256:aaaa" {
-		t.Errorf("ImageDigest = %q", claims.ImageDigest)
-	}
-	if claims.ImageID != "sha256:bbbb" {
-		t.Errorf("ImageID = %q", claims.ImageID)
-	}
-	if claims.RestartPolicy != "Never" {
-		t.Errorf("RestartPolicy = %q", claims.RestartPolicy)
-	}
-	if len(claims.Args) != 2 || claims.Args[0] != "sh" || claims.Args[1] != "-c" {
-		t.Errorf("Args = %v", claims.Args)
-	}
-	if claims.EnvVars["PATH"] != "/bin" {
-		t.Errorf("EnvVars = %v", claims.EnvVars)
-	}
-	if claims.OverriddenEnvVars["FOO"] != "bar" {
-		t.Errorf("OverriddenEnvVars = %v", claims.OverriddenEnvVars)
-	}
-	if len(claims.OverriddenArgs) != 1 || claims.OverriddenArgs[0] != "-c" {
-		t.Errorf("OverriddenArgs = %v", claims.OverriddenArgs)
+	if claims.WorkloadCommitment != hex.EncodeToString(testCommitment) {
+		t.Errorf("WorkloadCommitment = %q", claims.WorkloadCommitment)
 	}
 	if !claims.SeparatorSeen {
 		t.Error("SeparatorSeen = false")
@@ -174,7 +153,7 @@ func TestTamperedCELFailsReplay(t *testing.T) {
 func TestEventAfterSeparatorRejected(t *testing.T) {
 	soft := newSoftPCRs()
 	c := buildStandardCEL(t, soft)
-	appendCos(t, c, soft, tpmtoolscel.CosEventPCR, tpmtoolscel.EnvVarType, "SNEAKY=1")
+	appendCos(t, c, soft, tpmtoolscel.CosEventPCR, measure.WorkloadCommitmentType, testCommitment)
 	decoded := encodeDecode(t, c)
 	if err := decoded.Replay(soft.bank()); err != nil {
 		t.Fatalf("Replay: %v", err)
@@ -184,30 +163,50 @@ func TestEventAfterSeparatorRejected(t *testing.T) {
 	}
 }
 
-func TestDuplicateImageRefRejected(t *testing.T) {
+func TestDuplicateCommitmentRejected(t *testing.T) {
 	soft := newSoftPCRs()
 	c := gecel.NewPCR()
-	appendCos(t, c, soft, tpmtoolscel.CosEventPCR, tpmtoolscel.ImageRefType, "a")
-	appendCos(t, c, soft, tpmtoolscel.CosEventPCR, tpmtoolscel.ImageRefType, "b")
+	appendCos(t, c, soft, tpmtoolscel.CosEventPCR, measure.WorkloadCommitmentType, testCommitment)
+	appendCos(t, c, soft, tpmtoolscel.CosEventPCR, measure.WorkloadCommitmentType, testCommitment)
 	if _, err := claimsFromCEL(encodeDecode(t, c)); err == nil {
-		t.Error("duplicate ImageRef accepted, want error")
+		t.Error("duplicate WorkloadCommitment accepted, want error")
+	}
+}
+
+func TestMissingCommitmentRejected(t *testing.T) {
+	soft := newSoftPCRs()
+	c := gecel.NewPCR()
+	appendCos(t, c, soft, tpmtoolscel.CosEventPCR, tpmtoolscel.LaunchSeparatorType, nil)
+	if _, err := claimsFromCEL(encodeDecode(t, c)); err == nil {
+		t.Error("log without a WorkloadCommitment accepted, want error")
+	}
+}
+
+func TestWrongCommitmentSizeRejected(t *testing.T) {
+	soft := newSoftPCRs()
+	c := gecel.NewPCR()
+	appendCos(t, c, soft, tpmtoolscel.CosEventPCR, measure.WorkloadCommitmentType, []byte("short"))
+	if _, err := claimsFromCEL(encodeDecode(t, c)); err == nil {
+		t.Error("undersized commitment accepted, want error")
 	}
 }
 
 func TestWrongPCRRejected(t *testing.T) {
 	soft := newSoftPCRs()
 	c := gecel.NewPCR()
-	appendCos(t, c, soft, 12, tpmtoolscel.ImageRefType, "a")
+	appendCos(t, c, soft, 12, measure.WorkloadCommitmentType, testCommitment)
 	if _, err := claimsFromCEL(encodeDecode(t, c)); err == nil {
 		t.Error("event on PCR 12 accepted, want error")
 	}
 }
 
-func TestUnknownEventTypeRejected(t *testing.T) {
+// The legacy per-claim Confidential Space events are no longer meaningful in
+// this log; accepting them would let unverified semantics hide in evidence.
+func TestLegacyCosEventsRejected(t *testing.T) {
 	soft := newSoftPCRs()
 	c := gecel.NewPCR()
-	appendCos(t, c, soft, tpmtoolscel.CosEventPCR, tpmtoolscel.GpuCCModeType, "on")
+	appendCos(t, c, soft, tpmtoolscel.CosEventPCR, tpmtoolscel.ImageRefType, []byte("docker.io/library/busybox"))
 	if _, err := claimsFromCEL(encodeDecode(t, c)); err == nil {
-		t.Error("unsupported event type accepted, want error")
+		t.Error("legacy ImageRef event accepted, want error")
 	}
 }

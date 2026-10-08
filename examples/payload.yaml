@@ -1,0 +1,21 @@
+# Example workload payload for `verifier provision -payload`.
+#
+# This file is what gets ENCRYPTED to the verified VM — it never travels in
+# cleartext and never appears in instance metadata or public evidence.
+# Evidence reveals only its commitment (a salted hash), so env values may
+# hold secrets. Keep this file, and the receipt, private.
+
+# The container image to run. Always pin by digest: with a tag, the
+# registry chooses what the digest resolves to at pull time.
+image: docker.io/library/busybox@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+
+# Optional: override the image CMD (docker semantics: the ENTRYPOINT is
+# kept, cmd replaces the image CMD).
+cmd: ["sh", "-c", "echo hello from a provisioned workload"]
+
+# Optional: environment variable overrides.
+# env:
+#   API_TOKEN: secret-value
+
+# Optional: Always | OnFailure | Never (default Never).
+restartPolicy: Never

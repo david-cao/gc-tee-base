@@ -46,7 +46,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	att, err := wire.Decode(data)
+	_, att, err := wire.DecodeEnvelope(data)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -81,6 +81,20 @@ func main() {
 	fmt.Println("=== final folded values (sha256):")
 	for idx, digest := range running {
 		fmt.Printf("  PCR %2d: %s\n", idx, hex.EncodeToString(digest))
+	}
+
+	// TDX evidence: print the hardware measurement registers from the quote
+	// (MRTD = TD firmware launch measurement, RTMRs = runtime registers the
+	// firmware/stub extend with the boot chain). These are the TDX-side
+	// calibration ground truth, SHA-384, carried under Intel's signature.
+	if tdx := att.GetTdxAttestation(); tdx != nil {
+		body := tdx.GetTdQuoteBody()
+		fmt.Println("=== TDX quote (sha384, Intel-signed):")
+		fmt.Printf("  MRTD:    %s\n", hex.EncodeToString(body.GetMrTd()))
+		for i, r := range body.GetRtmrs() {
+			fmt.Printf("  RTMR[%d]: %s\n", i, hex.EncodeToString(r))
+		}
+		fmt.Printf("  TD_ATTRIBUTES: %s\n", hex.EncodeToString(body.GetTdAttributes()))
 	}
 }
 

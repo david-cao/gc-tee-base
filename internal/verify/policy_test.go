@@ -1,10 +1,13 @@
 package verify
 
 import (
+	"strings"
 	"testing"
 
 	attestpb "github.com/google/go-tpm-tools/proto/attest"
 )
+
+const testCommitmentHex = "abababababababababababababababababababababababababababababababab"
 
 func passingResult() *Result {
 	return &Result{
@@ -20,26 +23,28 @@ func passingResult() *Result {
 			SecureBoot: &attestpb.SecureBootState{Enabled: true},
 		},
 		Claims: &Claims{
-			ImageRef:          "docker.io/library/busybox:latest",
-			ImageDigest:       "sha256:aaaa",
-			ImageID:           "sha256:bbbb",
-			RestartPolicy:     "Never",
-			Args:              []string{"sh"},
-			EnvVars:           map[string]string{},
-			OverriddenArgs:    []string{},
-			OverriddenEnvVars: map[string]string{},
-			SeparatorSeen:     true,
+			Provisioned:        true,
+			WorkloadCommitment: testCommitmentHex,
+			SeparatorSeen:      true,
+		},
+		TEE: &TEEResult{
+			Kind:            string(TEEKindSevSnp),
+			Measurement:     strings.Repeat("12", 48),
+			ReportDataBound: true,
 		},
 	}
 }
 
 func TestPolicyPass(t *testing.T) {
 	p := Policy{
-		ImageDigest:       "sha256:aaaa",
-		ImageRefPattern:   `docker\.io/library/busybox:.*`,
-		ConfidentialTechs: []string{"AMD_SEV_SNP", "INTEL_TDX"},
-		RequireSecureBoot: true,
-		GCEInstance:       &GCEInstancePolicy{ProjectID: "my-project", Zone: "us-central1-a"},
+		WorkloadCommitment: testCommitmentHex,
+		ConfidentialTechs:  []string{"AMD_SEV_SNP", "INTEL_TDX"},
+		RequireSecureBoot:  true,
+		GCEInstance:        &GCEInstancePolicy{ProjectID: "my-project", Zone: "us-central1-a"},
+		Hardware: &HardwarePolicy{
+			Require: true,
+			SNP:     &SNPPolicy{Measurement: strings.Repeat("12", 48)},
+		},
 	}
 	if violations := p.Evaluate(passingResult()); len(violations) != 0 {
 		t.Errorf("expected pass, got violations: %v", violations)
@@ -52,26 +57,28 @@ func TestPolicyViolations(t *testing.T) {
 		policy Policy
 		mutate func(*Result)
 	}{
-		{"wrong digest", Policy{ImageDigest: "sha256:other"}, nil},
-		{"missing digest in policy", Policy{}, nil},
-		{"ref pattern mismatch", Policy{ImageDigest: "sha256:aaaa", ImageRefPattern: `gcr\.io/.*`}, nil},
-		{"no separator", Policy{ImageDigest: "sha256:aaaa"}, func(r *Result) { r.Claims.SeparatorSeen = false }},
-		{"disallowed env override", Policy{ImageDigest: "sha256:aaaa"}, func(r *Result) {
-			r.Claims.OverriddenEnvVars["FOO"] = "bar"
+		{"wrong commitment", Policy{WorkloadCommitment: strings.Repeat("00", 32)}, nil},
+		{"missing commitment in policy", Policy{}, nil},
+		{"not provisioned", Policy{WorkloadCommitment: testCommitmentHex}, func(r *Result) {
+			r.Claims = &Claims{Provisioned: false}
 		}},
-		{"disallowed arg override", Policy{ImageDigest: "sha256:aaaa"}, func(r *Result) {
-			r.Claims.OverriddenArgs = []string{"--evil"}
+		{"no separator", Policy{WorkloadCommitment: testCommitmentHex}, func(r *Result) {
+			r.Claims.SeparatorSeen = false
 		}},
-		{"wrong tech", Policy{ImageDigest: "sha256:aaaa", ConfidentialTechs: []string{"INTEL_TDX"}}, nil},
-		{"secure boot off", Policy{ImageDigest: "sha256:aaaa", RequireSecureBoot: true}, func(r *Result) {
-			r.MachineState.SecureBoot.Enabled = false
-		}},
-		{"wrong instance", Policy{ImageDigest: "sha256:aaaa",
+		{"wrong tech", Policy{WorkloadCommitment: testCommitmentHex,
+			ConfidentialTechs: []string{"INTEL_TDX"}}, nil},
+		{"secure boot off", Policy{WorkloadCommitment: testCommitmentHex, RequireSecureBoot: true},
+			func(r *Result) { r.MachineState.SecureBoot.Enabled = false }},
+		{"wrong instance", Policy{WorkloadCommitment: testCommitmentHex,
 			GCEInstance: &GCEInstancePolicy{InstanceName: "other-vm"}}, nil},
-		{"instance pin without info", Policy{ImageDigest: "sha256:aaaa",
+		{"instance pin without info", Policy{WorkloadCommitment: testCommitmentHex,
 			GCEInstance: &GCEInstancePolicy{ProjectID: "my-project"}}, func(r *Result) {
 			r.MachineState.Platform.InstanceInfo = nil
 		}},
+		{"hardware required but absent", Policy{WorkloadCommitment: testCommitmentHex,
+			Hardware: &HardwarePolicy{Require: true}}, func(r *Result) { r.TEE = nil }},
+		{"wrong SNP measurement", Policy{WorkloadCommitment: testCommitmentHex,
+			Hardware: &HardwarePolicy{SNP: &SNPPolicy{Measurement: strings.Repeat("ff", 48)}}}, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -86,6 +93,46 @@ func TestPolicyViolations(t *testing.T) {
 	}
 }
 
+// The provisioning-stage policy must accept an unprovisioned VM while the
+// post-launch policy rejects it, and the hardware requirement must apply at
+// both stages.
+func TestEvaluateBase(t *testing.T) {
+	p := Policy{
+		ConfidentialTechs: []string{"AMD_SEV_SNP"},
+		Hardware:          &HardwarePolicy{Require: true},
+	}
+	r := passingResult()
+	r.Claims = &Claims{Provisioned: false}
+	if violations := p.EvaluateBase(r); len(violations) != 0 {
+		t.Errorf("EvaluateBase on a fresh VM: %v", violations)
+	}
+	if violations := p.Evaluate(r); len(violations) == 0 {
+		t.Error("full Evaluate accepted an unprovisioned VM")
+	}
+	r.TEE = nil
+	if violations := p.EvaluateBase(r); len(violations) == 0 {
+		t.Error("EvaluateBase accepted missing hardware report despite require")
+	}
+}
+
+func TestCheckUnprovisioned(t *testing.T) {
+	r := passingResult()
+	r.Claims = &Claims{Provisioned: false}
+	r.PCRs = map[string]map[int][]byte{"sha256": {13: make([]byte, 32)}}
+	if err := r.CheckUnprovisioned(); err != nil {
+		t.Errorf("fresh VM rejected: %v", err)
+	}
+	r.PCRs["sha256"][13][5] = 0x01
+	if err := r.CheckUnprovisioned(); err == nil {
+		t.Error("nonzero PCR 13 accepted as unprovisioned")
+	}
+	r.PCRs["sha256"][13][5] = 0x00
+	r.Claims.Provisioned = true
+	if err := r.CheckUnprovisioned(); err == nil {
+		t.Error("provisioned claims accepted as unprovisioned")
+	}
+}
+
 func TestPCRPinning(t *testing.T) {
 	r := passingResult()
 	r.PCRs = map[string]map[int][]byte{
@@ -94,7 +141,7 @@ func TestPCRPinning(t *testing.T) {
 			11: []byte{0xcc, 0xdd},
 		},
 	}
-	base := Policy{ImageDigest: "sha256:aaaa"}
+	base := Policy{WorkloadCommitment: testCommitmentHex}
 
 	pass := base
 	pass.PCRs = &PCRPolicy{Values: map[int]string{4: "aabb", 11: "ccdd"}}
@@ -142,19 +189,5 @@ func TestExpectedMeasurementsToPolicy(t *testing.T) {
 	}
 	if p.Bank != "sha256" || p.Values[4] != "aabb" || p.Values[11] != "ccdd" {
 		t.Errorf("PCRPolicy = %+v", p)
-	}
-}
-
-func TestAllowedOverrides(t *testing.T) {
-	p := Policy{
-		ImageDigest:         "sha256:aaaa",
-		AllowedOverrideEnvs: []string{"FOO"},
-		AllowOverrideArgs:   true,
-	}
-	r := passingResult()
-	r.Claims.OverriddenEnvVars["FOO"] = "bar"
-	r.Claims.OverriddenArgs = []string{"custom"}
-	if violations := p.Evaluate(r); len(violations) != 0 {
-		t.Errorf("expected pass with allowed overrides, got: %v", violations)
 	}
 }

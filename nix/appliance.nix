@@ -139,10 +139,13 @@ in
     after = [ "network-online.target" "containerd.service" "systemd-timesyncd.service" ];
     requires = [ "containerd.service" ];
     serviceConfig = {
-      # Launch spec comes from GCE instance metadata (tee-image-reference,
-      # tee-cmd, tee-env-*, tee-restart-policy). Restart= covers launcher
-      # failures only; the workload restart policy is the launcher's job.
-      ExecStart = "${launcher}/bin/launcher -metadata";
+      # The launcher boots in provisioning mode: per-boot HPKE key, evidence
+      # on :8080, workload delivered encrypted via POST /v1/workload (never
+      # via metadata; only tee-attest-addr is read). -linger keeps evidence
+      # verifiable after a one-shot workload exits. Restart= covers launcher
+      # failures only — a restart discards the key, invalidating any evidence
+      # bound to it; the workload restart policy is the launcher's job.
+      ExecStart = "${launcher}/bin/launcher -linger";
       Restart = "on-failure";
       RestartSec = 5;
       StandardOutput = "journal+console";

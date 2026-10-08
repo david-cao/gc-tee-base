@@ -74,9 +74,13 @@ func run(ukiPath, imageName, roothash, pcr4Variant, out string) error {
 	}
 	ukiSha := sha256.Sum256(uki)
 
-	pcr11, err := predictPCR11(uki)
+	pcr11, err := predictSectionFold(uki, crypto.SHA256)
 	if err != nil {
 		return fmt.Errorf("predicting PCR 11: %w", err)
+	}
+	rtmr2, err := predictSectionFold(uki, crypto.SHA384)
+	if err != nil {
+		return fmt.Errorf("predicting RTMR[2]: %w", err)
 	}
 	pcr4, err := predictPCR4Variants(uki)
 	if err != nil {
@@ -94,8 +98,17 @@ func run(ukiPath, imageName, roothash, pcr4Variant, out string) error {
 		PCRs: map[string]map[int]string{
 			"sha256": {4: selected, 11: pcr11},
 		},
-		Notes: fmt.Sprintf("pcr4 variant %q pinned (uki-only calibrated on GCE 2026-09-29); "+
-			"candidates: uki-only=%s uki-and-kernel=%s",
+		TDX: &verify.TDXExpected{
+			PCRs: map[string]map[int]string{
+				"sha256": {4: pcr4["tdx"], 11: pcr11},
+			},
+			RTMRs: map[int]string{2: rtmr2},
+		},
+		Notes: fmt.Sprintf("pcr4 variant %q pinned for SNP (uki-only calibrated on GCE 2026-09-29); "+
+			"candidates: uki-only=%s uki-and-kernel=%s. "+
+			"TDX profile calibrated 2026-10-07: PCR 4 holds no boot-application event "+
+			"(action+separator only, image-independent), the UKI section fold appears as "+
+			"RTMR[2] (sha384) in the Intel-signed quote.",
 			pcr4Variant, pcr4["uki-only"], pcr4["uki-and-kernel"]),
 	}
 
@@ -112,18 +125,32 @@ func run(ukiPath, imageName, roothash, pcr4Variant, out string) error {
 	return nil
 }
 
+func extendWith(h crypto.Hash, pcr []byte, digest []byte) []byte {
+	hh := h.New()
+	hh.Write(pcr)
+	hh.Write(digest)
+	return hh.Sum(nil)
+}
+
 func extend(pcr []byte, digest []byte) []byte {
-	sum := sha256.Sum256(append(pcr, digest...))
-	return sum[:]
+	return extendWith(crypto.SHA256, pcr, digest)
+}
+
+func hashWith(h crypto.Hash, data []byte) []byte {
+	hh := h.New()
+	hh.Write(data)
+	return hh.Sum(nil)
 }
 
 func hashOf(data []byte) []byte {
-	sum := sha256.Sum256(data)
-	return sum[:]
+	return hashWith(crypto.SHA256, data)
 }
 
-// predictPCR11 folds the systemd-stub section measurements.
-func predictPCR11(uki []byte) (string, error) {
+// predictSectionFold folds the systemd-stub section measurements with the
+// given hash: SHA-256 yields vTPM PCR 11; SHA-384 yields TDX RTMR[2] (the
+// stub emits the same events through the TPM and CC measurement protocols,
+// and PCR 11 maps to RTMR[2]).
+func predictSectionFold(uki []byte, h crypto.Hash) (string, error) {
 	f, err := pe.NewFile(&readerAt{data: uki})
 	if err != nil {
 		return "", fmt.Errorf("parsing UKI as PE: %w", err)
@@ -135,7 +162,7 @@ func predictPCR11(uki []byte) (string, error) {
 		sections[s.Name] = s
 	}
 
-	pcr := make([]byte, sha256.Size)
+	pcr := make([]byte, h.Size())
 	measured := 0
 	for _, name := range stubSectionOrder {
 		s, ok := sections[name]
@@ -151,8 +178,8 @@ func predictPCR11(uki []byte) (string, error) {
 		data := make([]byte, s.VirtualSize)
 		copy(data, uki[s.Offset:s.Offset+n])
 
-		pcr = extend(pcr, hashOf(append([]byte(name), 0)))
-		pcr = extend(pcr, hashOf(data))
+		pcr = extendWith(h, pcr, hashWith(h, append([]byte(name), 0)))
+		pcr = extendWith(h, pcr, hashWith(h, data))
 		measured++
 	}
 	if measured == 0 {
@@ -175,6 +202,10 @@ func predictPCR4Variants(uki []byte) (map[string]string, error) {
 
 	out := map[string]string{
 		"uki-only": hex.EncodeToString(ukiOnly),
+		// On TDX firmware the boot application is measured into RTMR[1]/[2]
+		// via the CC protocol instead of PCR 4; the vTPM PCR 4 ends at the
+		// separator (calibrated on GCE 2026-10-07).
+		"tdx": hex.EncodeToString(base),
 	}
 
 	// Historical alternative (not what GCE does): a second authentihash

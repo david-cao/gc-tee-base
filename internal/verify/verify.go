@@ -11,6 +11,8 @@ import (
 	"crypto/x509"
 	"fmt"
 
+	sevverify "github.com/google/go-sev-guest/verify"
+	tdxverify "github.com/google/go-tdx-guest/verify"
 	"github.com/google/go-tpm-tools/quote"
 	"github.com/google/go-tpm-tools/server"
 	"github.com/google/go-tpm/legacy/tpm2"
@@ -27,6 +29,25 @@ type Options struct {
 	// directly trusted AK public keys. Development/simulator use only: it
 	// proves nothing about where the TPM lives.
 	TrustedAKs []crypto.PublicKey
+
+	// HPKEPublicKey is the per-boot HPKE public key from the evidence
+	// envelope. Required to check a hardware report's REPORT_DATA binding
+	// (it is a transcript input).
+	HPKEPublicKey []byte
+
+	// SNPProductLine ("Milan", "Genoa", ...) selects the AMD cert-chain
+	// roots when the SNP report itself does not identify the product
+	// (report version 2). Leave empty to use go-sev-guest's default.
+	SNPProductLine string
+
+	// SNPVerifyOptions overrides the full SNP chain-verification options.
+	// Tests use it to inject fake AMD roots; production leaves it nil.
+	SNPVerifyOptions *sevverify.Options
+
+	// TDXVerifyOptions overrides the TDX chain-verification options. Tests
+	// use it to pin validation times for canned quotes; production leaves
+	// it nil (embedded Intel roots, current time).
+	TDXVerifyOptions *tdxverify.Options
 }
 
 // Result is successfully verified evidence.
@@ -41,6 +62,12 @@ type Result struct {
 	// the caller's nonce. Used for golden-value pinning (e.g. PCR 4/11 of a
 	// measured base image).
 	PCRs map[string]map[int][]byte
+	// TEE is the verified hardware attestation report (AMD-rooted), or nil
+	// when the evidence carries none. Policy decides whether nil passes.
+	TEE *TEEResult
+	// AKPubSPKI is the PKIX/DER encoding of the trusted AK public key — a
+	// transcript input the provisioner needs for sealing a payload.
+	AKPubSPKI []byte
 }
 
 // Verify runs the full pipeline on attestation evidence. On success, every
@@ -80,7 +107,38 @@ func Verify(att *attestpb.Attestation, opts Options) (*Result, error) {
 		return nil, fmt.Errorf("PCR verification failed: %w", err)
 	}
 
-	return &Result{MachineState: machineState, Claims: claims, PCRs: pcrs}, nil
+	akPubSPKI, err := x509.MarshalPKIXPublicKey(akPub)
+	if err != nil {
+		return nil, fmt.Errorf("encoding trusted AK public key: %w", err)
+	}
+	tee, err := verifyTEE(att, akPubSPKI, opts)
+	if err != nil {
+		return nil, fmt.Errorf("hardware report verification failed: %w", err)
+	}
+
+	return &Result{MachineState: machineState, Claims: claims, PCRs: pcrs, TEE: tee, AKPubSPKI: akPubSPKI}, nil
+}
+
+// CheckUnprovisioned confirms the evidence describes a fresh base layer: no
+// workload claims and PCR 13 still zero in every verified bank. Run it
+// before encrypting a payload to the evidence's HPKE key.
+func (r *Result) CheckUnprovisioned() error {
+	if r.Claims.Provisioned {
+		return fmt.Errorf("a workload was already provisioned (commitment %s)", r.Claims.WorkloadCommitment)
+	}
+	for bank, values := range r.PCRs {
+		digest, ok := values[13]
+		if !ok {
+			continue
+		}
+		for _, b := range digest {
+			if b != 0 {
+				return fmt.Errorf("PCR 13 (%s bank) is nonzero (%x): something was measured on this VM already",
+					bank, digest)
+			}
+		}
+	}
+	return nil
 }
 
 // verifiedPCRs checks every supported-bank quote against the trusted AK and

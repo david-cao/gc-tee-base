@@ -6,10 +6,18 @@ by systemd-stub) whose command line seals the dm-verity hash (`usrhash=`) of
 the erofs partition holding `/nix/store`. On NixOS every measured-relevant
 artifact — systemd, kernel modules, containerd, the launcher, every unit
 file — is a store path, so pinning PCR 4/11 pins the entire base layer.
+
+This image is the *content* half of the trust chain (see "How trust is
+rooted" in the [root README](../README.md)): PCR 4/11 identify the exact
+launcher binary — the process that holds the per-boot HPKE decryption key,
+accepts the encrypted workload payload, and measures its commitment into
+PCR 13. Trusting a payload delivery therefore reduces to trusting these
+two PCR values, which anyone can re-derive from this reproducible build.
 `/` is tmpfs; `/var` is writable ext4 for containerd state (outside the
-measurement by design: workload integrity is anchored by the launcher's
-PCR 13 image-digest measurement). Secure boot stays off; the verifier
-*detects* modified images via PCR pinning.
+measurement by design: workload integrity is anchored by the commitment
+the launcher measures into PCR 13, and the image digest pinned inside the
+payload it commits to). Secure boot stays off; the verifier *detects*
+modified images via PCR pinning.
 
 This replaces the earlier mkosi image (../image/, kept until this image
 passes calibration). The measurement story is identical with
@@ -51,9 +59,11 @@ here.
   tpm2-tools (calibration only); [variant-prod.nix](variant-prod.nix) — no
   login path at all
 - [launcher.nix](launcher.nix) — `buildGoModule` from the in-repo sources.
-  **vendorHash workflow**: when `go.mod`/`go.sum` change, set
-  `vendorHash = lib.fakeHash`, build once, copy the `got: sha256-...` value
-  from the error into the file.
+  **vendorHash workflow**: when `go.mod`/`go.sum` or the import graph
+  change, set `vendorHash = lib.fakeHash`, run `nix build .#launcher`
+  (works on any system, including macOS — the vendor derivation is
+  platform-independent), and copy the `got: sha256-...` value from the
+  error into the file.
 
 Build with [../deploy/build-image.sh](../deploy/build-image.sh) (installs
 Nix on a throwaway GCE builder VM and runs `nix build`).
@@ -77,20 +87,24 @@ against real GCE firmware and recorded below:
 Steps:
 
 1. `deploy/build-image.sh -p dev`, then
-   `deploy/create-instance.sh -i <image> -w <workload@sha256:...>`.
+   `deploy/create-instance.sh -i <image>` (the VM boots bare, in
+   provisioning mode).
 2. Watch `gcloud compute instances get-serial-port-output <name>`: UKI
    boot, `/dev/mapper/usr` active, DHCP lease with MTU 1460, containerd up,
-   launcher pulling and serving on :8080.
+   launcher serving on :8080 and waiting for an encrypted payload
+   (`hardware report device: sev-snp` in its log).
 3. On the serial console (root autologin): confirm `usrhash=` in
    `/proc/cmdline` and `/nix/store` read-only;
    `tpm2_pcrread sha256:0,4,7,11,12,13`; compare PCR 4/11 against the
    candidates in `expected-measurements.json` (`notes` field). Copy
    `/sys/kernel/security/tpm0/binary_bios_measurements` off the VM for
-   event-level debugging. Confirm PCR 13 was zero before the launcher ran.
+   event-level debugging. Confirm PCR 13 is zero pre-provisioning.
 4. If `uki-only` is the correct PCR 4 variant, re-run
    `predict-measurements -pcr4-variant uki-only ...` and record it below.
-5. `verifier verify -host <ip>:8080 -policy <policy> -expected
-   <expected-measurements.json>` → PASS; rebuild the image with any change
+5. `verifier provision -host <ip>:8080 -policy <policy> -payload
+   <payload.yaml> -expected <expected-measurements.json>` → provisions;
+   then `verifier verify -host <ip>:8080 -policy <policy> -receipt
+   receipt.json -expected ...` → PASS; rebuild the image with any change
    and confirm the old expected values now FAIL.
 6. Rebuild `-p prod` and re-validate via the verifier alone (no console).
 
@@ -123,3 +137,64 @@ End-to-end `verifier verify -host ... -expected ...` → POLICY: PASS.
 - Tamper check: predictions from the stale (mismatched) UKI correctly
   produced POLICY: FAIL with the quoted-vs-expected values shown.
 - Reproducibility double-build check: — (pending)
+
+### Two-stage provisioning validation (2026-09-30)
+
+Validated end-to-end against `gc-tee-base-dev-20260930-161730` on a fresh
+SEV-SNP VM (n2d-standard-2, us-central1-c), with the launcher in
+provisioning mode (`teeKind: sev-snp` auto-detected):
+
+- `verifier provision` verified the fresh VM (PCR 4/11 pins, PCR 13 zero,
+  **SNP report chained to AMD's real Milan roots** with the
+  transcript-bound `REPORT_DATA`), delivered the encrypted busybox payload,
+  and the workload ran; post-exit `verifier verify -receipt` → POLICY:
+  PASS (the launcher unit passes `-linger`, added after the first attempt
+  showed a one-shot workload taking the evidence server down with it).
+- Google's live UEFI launch measurement (n2d-standard-2, 2 vCPUs,
+  2026-09-30, deterministic across two VMs):
+  `ccdc5cf01ba25526bd65503d95931b787b4385a3277cfe4448addf9c3e894948ae8cf7b099620e3e22717de2fb5d26fa`
+  — pinned via `hardware.snp.measurement` it PASSes, and a wrong value
+  FAILs. Note the measurement depends on vCPU count and Google's firmware
+  release; retrieve the signed endorsement per the README before pinning
+  in production.
+- Negative paths: re-provisioning a provisioned VM is refused
+  ("already provisioned"); a second `POST /v1/workload` → 409; stale
+  expected-measurements from the previous image → PCR 4/11 FAIL;
+  wrong `-commitment` → FAIL.
+
+### TDX calibration (2026-10-07)
+
+Validated end-to-end against the same image
+(`gc-tee-base-dev-20260930-161730`, built before TDX work — no image
+change needed) on a fresh TDX VM (c3-standard-4, us-central1-a):
+
+- **Boots unchanged**: GCE's TDX firmware boots the fallback-path UKI;
+  gVNIC/containerd/launcher come up; the NixOS kernel has configfs-tsm +
+  TDX guest support out of the box, so the launcher reports
+  `teeKind: tdx` and TDX quotes flow with no image modification.
+- **PCR 4 differs from SNP — and is image-independent on TDX.** The TPM
+  log holds only EV_EFI_ACTION + EV_SEPARATOR; there is NO
+  EV_EFI_BOOT_SERVICES_APPLICATION event for the UKI. The boot-application
+  measurement moved to the Intel-signed RTMRs. predict-measurements emits
+  this as the `tdx` PCR 4 variant (the action+separator fold).
+- **RTMR[2] = the stub section fold in SHA-384.** Exactly the PCR 11
+  model (sha384(ASCII name + NUL), then sha384(content padded to
+  VirtualSize), stub order, ending at `.sbat`) — systemd-stub emits the
+  same events through the CC measurement protocol, and PCR 11 maps to
+  RTMR[2]. Predicted offline from the UKI, matched the live quote
+  bit-for-bit, and a wrong pin FAILs. **This is the Intel-rooted pin of
+  the exact base image** (kernel, initrd, cmdline with `usrhash=`).
+- PCR 11 (vTPM) is identical to the SNP boot — same UKI, same stub fold.
+- RTMR[1] (bootloader per Google's docs) did not reproduce from the TPM
+  log's SHA-384 bank (the CC-side log contains events the TPM log lacks,
+  and PCR 5's GPT/boot-variable events may be instance-specific) —
+  reconstructing it needs the CCEL
+  (`/sys/firmware/acpi/tables/data/CCEL`); not needed for image pinning
+  since RTMR[2] covers the full UKI contents. RTMR[3] is zero (userspace
+  register — a future home for the workload commitment).
+- Observed MRTD (Google TD firmware, c3-standard-4, 2026-10-07):
+  `c1ee9c16e3afc506cfe042c5b846a368528f3b37618eafb27469bc114cf914e9222c91618470e7f2b28ac360968270a5`
+  (pin via `hardware.tdx.mrTd` after checking Google's signed endorsement).
+- E2E: `verifier provision` (Intel chain + REPORT_DATA transcript binding
+  + RTMR[2]/PCR pins) → workload ran → post-exit `verify -receipt` →
+  POLICY: PASS; wrong RTMR[2] pin → FAIL.

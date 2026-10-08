@@ -3,10 +3,8 @@ package spec
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"testing"
 )
 
@@ -25,81 +23,58 @@ func metadataServer(t *testing.T, attrs map[string]string) *httptest.Server {
 	}))
 }
 
-func TestFromMetadata(t *testing.T) {
+func TestAttestAddrFromMetadata(t *testing.T) {
 	ts := metadataServer(t, map[string]string{
-		"tee-image-reference": "docker.io/library/busybox@sha256:abc",
-		"tee-cmd":             `["sh","-c","sleep 5"]`,
-		"tee-env-FOO":         "bar",
-		"tee-env-BAZ":         "qux",
-		"tee-restart-policy":  "OnFailure",
-		"tee-attest-addr":     "0.0.0.0:9090",
-		"ssh-keys":            "ignored:ssh-rsa AAAA",
-		"startup-script":      "#!/bin/sh ignored",
+		"tee-attest-addr": "0.0.0.0:9090",
+		"ssh-keys":        "ignored:ssh-rsa AAAA",
+		"startup-script":  "#!/bin/sh ignored",
 	})
 	defer ts.Close()
 
-	s, err := FromMetadata(context.Background(), ts.URL)
+	addr, err := AttestAddrFromMetadata(context.Background(), ts.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.ImageRef != "docker.io/library/busybox@sha256:abc" {
-		t.Errorf("ImageRef = %q", s.ImageRef)
-	}
-	if !reflect.DeepEqual(s.Cmd, []string{"sh", "-c", "sleep 5"}) {
-		t.Errorf("Cmd = %v", s.Cmd)
-	}
-	if !reflect.DeepEqual(s.Envs, map[string]string{"FOO": "bar", "BAZ": "qux"}) {
-		t.Errorf("Envs = %v", s.Envs)
-	}
-	if s.RestartPolicy != "OnFailure" {
-		t.Errorf("RestartPolicy = %q", s.RestartPolicy)
-	}
-	if s.AttestAddr != "0.0.0.0:9090" {
-		t.Errorf("AttestAddr = %q", s.AttestAddr)
-	}
-
-	s.ApplyDefaults()
-	if err := s.Validate(); err != nil {
-		t.Errorf("Validate: %v", err)
+	if addr != "0.0.0.0:9090" {
+		t.Errorf("addr = %q", addr)
 	}
 }
 
-func TestFromMetadataNoWorkload(t *testing.T) {
+func TestAttestAddrFromMetadataAbsent(t *testing.T) {
 	ts := metadataServer(t, map[string]string{"ssh-keys": "whatever"})
 	defer ts.Close()
 
-	_, err := FromMetadata(context.Background(), ts.URL)
-	if !errors.Is(err, ErrNoMetadataSpec) {
-		t.Errorf("err = %v, want ErrNoMetadataSpec", err)
+	addr, err := AttestAddrFromMetadata(context.Background(), ts.URL)
+	if err != nil || addr != "" {
+		t.Errorf("got (%q, %v), want empty and nil", addr, err)
 	}
 }
 
-func TestFromMetadataUnknownTeeKey(t *testing.T) {
+// The old metadata workload keys must fail loudly: silently ignoring them
+// would run a VM without the workload its operator thinks was configured.
+func TestRemovedWorkloadKeysRejected(t *testing.T) {
+	for _, key := range []string{"tee-image-reference", "tee-cmd", "tee-restart-policy", "tee-env-FOO"} {
+		ts := metadataServer(t, map[string]string{key: "value"})
+		if _, err := AttestAddrFromMetadata(context.Background(), ts.URL); err == nil {
+			t.Errorf("removed workload key %q accepted, want error", key)
+		}
+		ts.Close()
+	}
+}
+
+func TestUnknownTeeKeyRejected(t *testing.T) {
 	ts := metadataServer(t, map[string]string{
-		"tee-image-reference": "img",
-		"tee-restart-polcy":   "Always", // typo must fail closed
+		"tee-attest-adr": "typo", // typo must fail closed
 	})
 	defer ts.Close()
 
-	if _, err := FromMetadata(context.Background(), ts.URL); err == nil {
+	if _, err := AttestAddrFromMetadata(context.Background(), ts.URL); err == nil {
 		t.Error("unknown tee-* key accepted, want error")
 	}
 }
 
-func TestFromMetadataBadCmd(t *testing.T) {
-	ts := metadataServer(t, map[string]string{
-		"tee-image-reference": "img",
-		"tee-cmd":             "not-json",
-	})
-	defer ts.Close()
-
-	if _, err := FromMetadata(context.Background(), ts.URL); err == nil {
-		t.Error("non-JSON tee-cmd accepted, want error")
-	}
-}
-
-func TestFromMetadataUnreachable(t *testing.T) {
-	if _, err := FromMetadata(context.Background(), "http://127.0.0.1:1"); err == nil {
+func TestMetadataUnreachable(t *testing.T) {
+	if _, err := AttestAddrFromMetadata(context.Background(), "http://127.0.0.1:1"); err == nil {
 		t.Error("unreachable metadata server did not error")
 	}
 }

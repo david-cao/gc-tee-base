@@ -3,11 +3,9 @@ package spec
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 )
@@ -16,33 +14,49 @@ import (
 // only reachable from inside a GCE VM.
 const DefaultMetadataBase = "http://metadata.google.internal"
 
-// Metadata attribute keys, mirroring Confidential Space so specs are portable
-// between the two launchers. tee-attest-addr is our own extension.
-const (
-	metaImageRef      = "tee-image-reference"
-	metaCmd           = "tee-cmd"
-	metaRestartPolicy = "tee-restart-policy"
-	metaAttestAddr    = "tee-attest-addr"
-	metaEnvPrefix     = "tee-env-"
-)
+// The only supported metadata attribute. The workload itself is delivered
+// via the encrypted provisioning flow (POST /v1/workload), never via
+// metadata: metadata is cleartext to anyone with project access.
+const metaAttestAddr = "tee-attest-addr"
 
-// ErrNoMetadataSpec is returned when the metadata server is reachable but the
-// instance has no tee-image-reference attribute (i.e. no workload was
-// configured via metadata).
-var ErrNoMetadataSpec = errors.New("instance metadata has no " + metaImageRef + " attribute")
+// Workload keys from the metadata-based flow (and Confidential Space). They
+// are rejected with a pointed error so a stale deployment fails loudly
+// instead of silently ignoring its workload configuration.
+var removedWorkloadKeys = []string{
+	"tee-image-reference", "tee-cmd", "tee-restart-policy",
+}
 
-// FromMetadata builds a LaunchSpec from GCE instance metadata attributes.
-// baseURL is the metadata server base (DefaultMetadataBase outside tests).
-//
-// Unknown tee-* keys are an error: an operator typo must fail the launch, not
-// silently drop a measured override. Non-tee keys (ssh-keys, startup-script,
-// ...) are ignored.
-func FromMetadata(ctx context.Context, baseURL string) (*LaunchSpec, error) {
+// AttestAddrFromMetadata returns the tee-attest-addr attribute, or "" if the
+// instance does not set it. Unknown tee-* keys are an error: an operator
+// typo must fail the launch, not be silently dropped. Non-tee keys
+// (ssh-keys, startup-script, ...) are ignored.
+func AttestAddrFromMetadata(ctx context.Context, baseURL string) (string, error) {
 	attrs, err := fetchAttributes(ctx, baseURL)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	return specFromAttributes(attrs)
+	addr := ""
+	for key, value := range attrs {
+		switch {
+		case key == metaAttestAddr:
+			addr = value
+		case isRemovedWorkloadKey(key):
+			return "", fmt.Errorf("metadata key %q is no longer supported: the workload is delivered "+
+				"as an encrypted payload (verifier provision), not via instance metadata", key)
+		case strings.HasPrefix(key, "tee-"):
+			return "", fmt.Errorf("unknown tee-* metadata key %q (only %s is supported)", key, metaAttestAddr)
+		}
+	}
+	return addr, nil
+}
+
+func isRemovedWorkloadKey(key string) bool {
+	for _, k := range removedWorkloadKeys {
+		if key == k {
+			return true
+		}
+	}
+	return strings.HasPrefix(key, "tee-env-")
 }
 
 func fetchAttributes(ctx context.Context, baseURL string) (map[string]string, error) {
@@ -73,50 +87,4 @@ func fetchAttributes(ctx context.Context, baseURL string) (map[string]string, er
 		return nil, fmt.Errorf("parsing metadata attributes: %w", err)
 	}
 	return attrs, nil
-}
-
-func specFromAttributes(attrs map[string]string) (*LaunchSpec, error) {
-	if _, ok := attrs[metaImageRef]; !ok {
-		return nil, ErrNoMetadataSpec
-	}
-
-	s := &LaunchSpec{}
-	// Deterministic iteration keeps error messages stable.
-	keys := make([]string, 0, len(attrs))
-	for k := range attrs {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	for _, key := range keys {
-		value := attrs[key]
-		switch {
-		case key == metaImageRef:
-			s.ImageRef = value
-		case key == metaCmd:
-			var cmd []string
-			if err := json.Unmarshal([]byte(value), &cmd); err != nil {
-				return nil, fmt.Errorf("%s must be a JSON string array (e.g. [\"sh\",\"-c\",\"...\"]): %w",
-					metaCmd, err)
-			}
-			s.Cmd = cmd
-		case key == metaRestartPolicy:
-			s.RestartPolicy = value
-		case key == metaAttestAddr:
-			s.AttestAddr = value
-		case strings.HasPrefix(key, metaEnvPrefix):
-			name := strings.TrimPrefix(key, metaEnvPrefix)
-			if name == "" {
-				return nil, fmt.Errorf("metadata key %q has an empty env var name", key)
-			}
-			if s.Envs == nil {
-				s.Envs = map[string]string{}
-			}
-			s.Envs[name] = value
-		case strings.HasPrefix(key, "tee-"):
-			return nil, fmt.Errorf("unknown tee-* metadata key %q (supported: %s, %s, %s, %s, %s<NAME>)",
-				key, metaImageRef, metaCmd, metaRestartPolicy, metaAttestAddr, metaEnvPrefix)
-		}
-	}
-	return s, nil
 }

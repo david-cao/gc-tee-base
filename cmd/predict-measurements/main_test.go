@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,8 +11,8 @@ import (
 
 func TestGarbageInputErrors(t *testing.T) {
 	garbage := []byte("this is not a PE file at all")
-	if _, err := predictPCR11(garbage); err == nil {
-		t.Error("predictPCR11 accepted garbage input")
+	if _, err := predictSectionFold(garbage, crypto.SHA256); err == nil {
+		t.Error("predictSectionFold accepted garbage input")
 	}
 	if _, err := predictPCR4Variants(garbage); err == nil {
 		t.Error("predictPCR4Variants accepted garbage input")

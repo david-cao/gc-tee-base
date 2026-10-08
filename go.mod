@@ -6,6 +6,8 @@ require (
 	github.com/containerd/containerd v1.7.35
 	github.com/edgelesssys/uplosi v0.4.0
 	github.com/google/go-eventlog v0.0.3-0.20260617163629-883cc5652c69
+	github.com/google/go-sev-guest v0.14.0
+	github.com/google/go-tdx-guest v0.3.2-0.20250814004405-ffb0869e6f4d
 	github.com/google/go-tpm v0.9.8
 	github.com/google/go-tpm-tools v0.4.10
 	github.com/opencontainers/image-spec v1.1.0
@@ -42,8 +44,6 @@ require (
 	github.com/google/go-attestation v0.6.4 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/go-configfs-tsm v0.3.3 // indirect
-	github.com/google/go-sev-guest v0.14.0 // indirect
-	github.com/google/go-tdx-guest v0.3.2-0.20250814004405-ffb0869e6f4d // indirect
 	github.com/google/logger v1.1.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect

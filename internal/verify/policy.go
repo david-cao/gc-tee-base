@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -13,29 +12,24 @@ import (
 	attestpb "github.com/google/go-tpm-tools/proto/attest"
 )
 
-// Policy is what a relying party requires of verified evidence. The zero
-// value accepts nothing: ImageDigest is mandatory.
+// Policy is what a relying party requires of verified evidence.
 type Policy struct {
-	// ImageDigest is the exact manifest digest the workload must run
-	// ("sha256:..."). Required.
-	ImageDigest string `yaml:"imageDigest"`
-
-	// ImageRefPattern, if set, is an anchored regular expression the image
-	// reference must match.
-	ImageRefPattern string `yaml:"imageRefPattern"`
-
-	// AllowedOverrideEnvs lists env var names the operator may override.
-	// Any other override fails the policy. Default: none allowed.
-	AllowedOverrideEnvs []string `yaml:"allowedEnvOverrides"`
-
-	// AllowOverrideArgs permits the operator to override the container
-	// command. Default: not allowed.
-	AllowOverrideArgs bool `yaml:"allowArgOverrides"`
+	// WorkloadCommitment is the hex sha256 of the payload plaintext the
+	// workload must be running (from a provisioning receipt). Usually
+	// supplied at verify time (-receipt/-commitment) rather than written
+	// here; either way it is required for post-launch verification.
+	WorkloadCommitment string `yaml:"workloadCommitment"`
 
 	// ConfidentialTechs lists acceptable confidential computing technologies
-	// (any of AMD_SEV, AMD_SEV_ES, AMD_SEV_SNP, INTEL_TDX). Empty means the
-	// platform is not checked, which also accepts non-confidential VMs.
+	// (any of AMD_SEV, AMD_SEV_ES, AMD_SEV_SNP, INTEL_TDX) as asserted by
+	// the boot log (Google-attested). Empty means the platform is not
+	// checked, which also accepts non-confidential VMs. For the AMD-rooted
+	// proof, set hardware.require.
 	ConfidentialTechs []string `yaml:"confidentialTechs"`
+
+	// Hardware states requirements on the hardware attestation report (the
+	// AMD-rooted part of the chain).
+	Hardware *HardwarePolicy `yaml:"hardware"`
 
 	// RequireSecureBoot fails evidence from VMs booted without secure boot.
 	// For custom measured images (unsigned UKI, secure boot off) leave this
@@ -52,6 +46,49 @@ type Policy struct {
 	// GCEInstance, if set, pins the evidence to one VM identity taken from
 	// the Google-issued AK certificate.
 	GCEInstance *GCEInstancePolicy `yaml:"gceInstance"`
+}
+
+// HardwarePolicy states requirements on the CPU-vendor-rooted attestation
+// report.
+type HardwarePolicy struct {
+	// Require fails evidence that carries no verified hardware report. With
+	// it false, a present report is still verified (bad reports always
+	// fail), but absence is accepted — the chain is then vTPM-only.
+	Require bool `yaml:"require"`
+
+	// TDX holds Intel TDX specifics.
+	TDX *TDXPolicy `yaml:"tdx"`
+
+	// SNP holds SEV-SNP specifics.
+	SNP *SNPPolicy `yaml:"snp"`
+}
+
+// TDXPolicy pins Intel TDX quote fields.
+type TDXPolicy struct {
+	// MrTd, if set, is the expected hex MRTD (48 bytes): the launch
+	// measurement of the TD firmware — on GCE, Google's firmware, covered
+	// by Google's signed launch endorsements.
+	MrTd string `yaml:"mrTd"`
+
+	// Rtmrs, if set, pins runtime measurement registers by index (0–3),
+	// hex. On GCE the firmware extends RTMR[1]/[2] with the boot chain
+	// (bootloader/UKI, kernel + cmdline), so pinning them pins the base
+	// image under the Intel root. Obtain golden values from a calibration
+	// run of the image build.
+	Rtmrs map[int]string `yaml:"rtmrs"`
+}
+
+// SNPPolicy pins SEV-SNP report fields.
+type SNPPolicy struct {
+	// ProductLine ("Milan", "Genoa", ...) selects the AMD root certificates
+	// when the report does not identify the CPU product itself.
+	ProductLine string `yaml:"productLine"`
+
+	// Measurement, if set, is the expected hex launch measurement (48
+	// bytes): on GCE, the measurement of Google's UEFI firmware. Obtain the
+	// value from a trusted run or from Google's signed launch endorsement
+	// (gs://gce_tcb_integrity, see the README).
+	Measurement string `yaml:"measurement"`
 }
 
 // PCRPolicy pins exact PCR values within one bank.
@@ -83,47 +120,39 @@ func LoadPolicy(path string) (*Policy, error) {
 	return &p, nil
 }
 
-// Evaluate checks verified evidence against the policy and returns every
-// violation (empty means the policy passed).
+// Evaluate checks verified post-launch evidence against the policy and
+// returns every violation (empty means the policy passed): platform checks
+// plus the workload commitment.
 func (p *Policy) Evaluate(r *Result) []error {
-	var violations []error
+	violations := p.EvaluateBase(r)
 	fail := func(format string, args ...any) {
 		violations = append(violations, fmt.Errorf(format, args...))
 	}
 
 	c := r.Claims
-
-	if p.ImageDigest == "" {
-		fail("policy is missing required imageDigest")
-	} else if c.ImageDigest != p.ImageDigest {
-		fail("image digest %q does not match required %q", c.ImageDigest, p.ImageDigest)
+	if !c.Provisioned {
+		fail("no workload has been provisioned on this VM yet")
+		return violations
 	}
-
-	if p.ImageRefPattern != "" {
-		re, err := regexp.Compile("^(?:" + p.ImageRefPattern + ")$")
-		if err != nil {
-			fail("invalid imageRefPattern: %v", err)
-		} else if !re.MatchString(c.ImageRef) {
-			fail("image reference %q does not match pattern %q", c.ImageRef, p.ImageRefPattern)
-		}
+	if p.WorkloadCommitment == "" {
+		fail("policy is missing the required workloadCommitment (pass -receipt or -commitment)")
+	} else if !strings.EqualFold(c.WorkloadCommitment, p.WorkloadCommitment) {
+		fail("workload commitment %s does not match required %s", c.WorkloadCommitment, p.WorkloadCommitment)
 	}
-
 	if !c.SeparatorSeen {
 		fail("event log is missing the LaunchSeparator event (measurement may be incomplete)")
 	}
+	return violations
+}
 
-	allowedEnvs := map[string]bool{}
-	for _, name := range p.AllowedOverrideEnvs {
-		allowedEnvs[name] = true
-	}
-	for name := range c.OverriddenEnvVars {
-		if !allowedEnvs[name] {
-			fail("env var %q was overridden but is not in allowedEnvOverrides", name)
-		}
-	}
-
-	if len(c.OverriddenArgs) > 0 && !p.AllowOverrideArgs {
-		fail("container args were overridden but allowArgOverrides is false")
+// EvaluateBase checks the platform requirements only — everything except
+// the workload commitment. This is the stage-1 (provisioning) policy: run
+// it, together with Result.CheckUnprovisioned, before encrypting a payload
+// to the VM.
+func (p *Policy) EvaluateBase(r *Result) []error {
+	var violations []error
+	fail := func(format string, args ...any) {
+		violations = append(violations, fmt.Errorf(format, args...))
 	}
 
 	platform := r.MachineState.GetPlatform()
@@ -196,5 +225,65 @@ func (p *Policy) Evaluate(r *Result) []error {
 		}
 	}
 
+	if p.Hardware != nil {
+		if p.Hardware.Require && r.TEE == nil {
+			fail("policy requires a hardware attestation report but the evidence carries none " +
+				"(is the VM TDX/SEV-SNP with its guest report device available?)")
+		}
+		if r.TEE != nil {
+			// The technology blocks present in the policy define the
+			// accepted set: a policy that pins TDX fields must not be
+			// satisfiable by SNP evidence (whose RTMR pins would silently
+			// not apply), and vice versa. A policy with neither block
+			// accepts either technology.
+			if p.Hardware.TDX != nil || p.Hardware.SNP != nil {
+				kindAllowed := (r.TEE.Kind == string(TEEKindTdx) && p.Hardware.TDX != nil) ||
+					(r.TEE.Kind == string(TEEKindSevSnp) && p.Hardware.SNP != nil)
+				if !kindAllowed {
+					fail("evidence carries a %s report but the policy only configures %s",
+						r.TEE.Kind, hardwareKinds(p.Hardware))
+				}
+			}
+			switch {
+			case r.TEE.Kind == string(TEEKindSevSnp) && p.Hardware.SNP != nil:
+				if want := strings.ToLower(p.Hardware.SNP.Measurement); want != "" && r.TEE.Measurement != want {
+					fail("SNP launch measurement %s does not match required %s (unexpected firmware?)",
+						r.TEE.Measurement, want)
+				}
+			case r.TEE.Kind == string(TEEKindTdx) && p.Hardware.TDX != nil:
+				if want := strings.ToLower(p.Hardware.TDX.MrTd); want != "" && r.TEE.Measurement != want {
+					fail("TDX MRTD %s does not match required %s (unexpected firmware?)",
+						r.TEE.Measurement, want)
+				}
+				indices := make([]int, 0, len(p.Hardware.TDX.Rtmrs))
+				for idx := range p.Hardware.TDX.Rtmrs {
+					indices = append(indices, idx)
+				}
+				sort.Ints(indices)
+				for _, idx := range indices {
+					want := strings.ToLower(p.Hardware.TDX.Rtmrs[idx])
+					if idx < 0 || idx >= len(r.TEE.RTMRs) {
+						fail("policy pins RTMR[%d] but the quote carries %d RTMRs", idx, len(r.TEE.RTMRs))
+						continue
+					}
+					if r.TEE.RTMRs[idx] != want {
+						fail("RTMR[%d] is %s, expected %s", idx, r.TEE.RTMRs[idx], want)
+					}
+				}
+			}
+		}
+	}
+
 	return violations
+}
+
+func hardwareKinds(h *HardwarePolicy) string {
+	kinds := []string{}
+	if h.TDX != nil {
+		kinds = append(kinds, string(TEEKindTdx))
+	}
+	if h.SNP != nil {
+		kinds = append(kinds, string(TEEKindSevSnp))
+	}
+	return strings.Join(kinds, "/")
 }

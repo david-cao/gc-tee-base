@@ -27,12 +27,24 @@
           "image-${variant}" = cfg.system.build.image;
           "uki-${variant}" = cfg.system.build.uki;
         };
+      # The launcher on its own, buildable on any system. Its vendor
+      # derivation is platform-independent, so `nix build .#launcher` (even
+      # on a Mac) is the quick way to resolve nix/launcher.nix vendorHash
+      # after go.mod or import changes.
+      launcherFor = system:
+        (import nixpkgs { inherit system; }).callPackage ./nix/launcher.nix {
+          gcTeeSrc = self;
+        };
+      systems = [ "x86_64-linux" "aarch64-darwin" "x86_64-darwin" ];
     in {
       nixosConfigurations = {
         gc-tee-dev = mkSystem "dev";
         gc-tee-prod = mkSystem "prod";
       };
 
-      packages.x86_64-linux = forVariant "dev" // forVariant "prod";
+      packages = nixpkgs.lib.genAttrs systems (system:
+        { launcher = launcherFor system; }
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux")
+          (forVariant "dev" // forVariant "prod"));
     };
 }

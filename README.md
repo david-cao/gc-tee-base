@@ -1,56 +1,189 @@
 # gc-tee-base
 
 A base scaffold for running **attestable containers** on Google Cloud
-Confidential VMs — launch any container image and let a remote party
-cryptographically verify exactly which container is running, on which machine,
-with no special development in the workload itself.
+Confidential VMs — boot a measured VM, verify it remotely (down to Intel's
+or AMD's hardware root of trust), then deliver your workload as an **encrypted
+payload** that only that verified VM can read. A remote party can later
+confirm exactly which payload is running, without the payload's contents
+ever appearing in metadata, on the wire, or in public evidence.
 
-## How it works
+## The attestation flow
+
+Workloads are delivered in two stages: first verify a *fresh* machine, then
+hand it the workload encrypted to a key that only that verified machine
+holds. Attestation is not just a report you read — it gates what the VM is
+allowed to receive.
 
 ```
  CVM (Confidential VM with vTPM)                        anywhere
-┌─────────────────────────────────────────┐   ┌───────────────────────────┐
-│ measured NixOS image                    │   │ verifier                  │
-│  UKI+dm-verity  → PCR 4/11              │   │  1. generate nonce        │
-│ launcher (root)                         │   │  2. GET /v1/attestation   │
-│  1. pull image via containerd           │◄──┤  3. verify AK cert →      │
-│  2. extend PCR 13 with image digest +   │   │     Google CA, quote,     │
-│     runtime config (canonical event log)│   │     boot log, PCR pins,   │
-│  3. serve evidence on :8080             │   │     CEL replay            │
-│  4. start the container                 │   │  4. evaluate policy       │
-└─────────────────────────────────────────┘   └───────────────────────────┘
+┌──────────────────────────────────────────┐   ┌──────────────────────────────┐
+│ measured NixOS image                     │   │ verifier                     │
+│  UKI+dm-verity  → PCR 4/11               │   │ stage 1: provision           │
+│ launcher (root), per-boot HPKE key       │   │  1. nonce → GET /attestation │
+│  1. serve evidence on :8080              │◄──┤  2. verify: Google CA, quote,│
+│     (TDX/SNP quote binds nonce+AK+key)   │   │     boot log, PCR pins,      │
+│  2. decrypt payload, latch first valid   │◄──┤     SNP report → AMD roots,  │
+│  3. extend PCR 13 with sha256(payload)   │   │     PCR 13 == 0              │
+│  4. pull image, start container          │   │  3. encrypt payload to the   │
+│  5. keep serving evidence                │   │     attested key, POST it    │
+└──────────────────────────────────────────┘   │ stage 2: verify (later)      │
+                                               │  commitment == sha256(payload)│
+                                               └──────────────────────────────┘
 ```
 
-Trust chain (vTPM-only, identical on AMD SEV / SEV-SNP / Intel TDX):
+**Boot.** The VM boots the measured image: firmware measures the UKI into
+PCR 4, systemd-stub measures its sections (kernel, initrd, cmdline — which
+seals the dm-verity hash of the read-only system) into PCR 11. The
+launcher starts, generates a **per-boot X25519 HPKE keypair** that never
+leaves process memory, opens the hardware report device (TDX or SEV-SNP),
+and serves evidence. PCR 13 is untouched; no workload exists yet. (On TDX
+the firmware and stub have additionally measured the boot chain into the
+RTMRs — hardware-signed registers; see the next section.)
 
-1. **Google's GCE EK/AK CA** signs the vTPM's attestation key certificate —
-   the "trust Google's base measurements" anchor; the cert also names the
-   exact GCE instance. (Roots vendored in
-   [internal/verify/roots.go](internal/verify/roots.go).)
-2. The **AK signs a quote** over all PCRs plus the verifier's nonce
-   (freshness).
-3. The **TCG boot log** replays against the quoted PCRs — proving boot state
-   and *that the VM is actually confidential* (the confidential technology
-   is an event on PCR 0; the AK cert alone doesn't prove it).
-4. **PCR 4/11 golden-value pins** identify the exact base image: the
-   [measured NixOS appliance](nix/README.md) packs kernel + initrd + cmdline
-   into a UKI (measured by firmware and systemd-stub), and the cmdline seals
-   the dm-verity hash of the read-only layer holding the launcher and
-   containerd. Pinning PCR 4/11 therefore pins the exact launcher that
-   performs step 5. Expected values are computed offline from build
-   artifacts, and the image build is reproducible from `flake.lock`, so
-   anyone can rebuild and independently confirm them.
-5. The **canonical event log (CEL)** replays against quoted PCR 13 — proving
-   the container identity claims: image digest, image ID, args, env, restart
-   policy. The log itself carries no trust; it is a "decompression" of the
-   PCR value that the verifier re-derives.
-6. A user **policy** is evaluated over the verified claims.
+**Stage 1 — verify the fresh machine.** The provisioner sends a random
+nonce and gets back an evidence envelope: the AK certificate, quotes over
+all PCR banks (signed over the nonce), the TCG boot log, the canonical
+event log, the HPKE public key, and a hardware attestation report whose
+`REPORT_DATA` is a transcript hash
 
-The launcher measures **before** the workload starts (enforced structurally:
-starting a container requires the token returned by sealing the measurement),
-and the launcher process — never the workload — owns the TPM and the evidence
-server. Measurement uses the same event schema, PCR (13), and ordering as
-Google's Confidential Space launcher, so claims are directly comparable.
+```
+SHA-512( "gc-tee-base/provision/v1" ‖ nonce ‖ AK-pubkey ‖ HPKE-pubkey )
+```
+
+(fields length-prefixed; see
+[internal/provision](internal/provision/provision.go)) — computed *inside*
+the guest and signed by the hardware (the Intel TDX module's quoting
+chain, or the AMD Secure Processor). The
+verifier checks the whole chain (see the next section), checks that
+**PCR 13 is still zero** (nothing was ever measured on this boot), and
+evaluates the platform half of the policy.
+
+**Encrypted delivery.** Only if everything passes, the provisioner
+HPKE-encrypts the payload — image digest, command, env (secrets welcome) —
+to the attested public key, with the transcript baked into the HPKE `info`.
+The ciphertext is useless anywhere else: a different VM, a different boot
+of the same VM, or a different attestation session all derive a different
+key or transcript. The launcher decrypts and **latches**: the first valid
+payload wins, everything after (or malformed) is rejected.
+
+**Measure, then launch.** The launcher extends PCR 13 with one event — the
+**commitment**, `sha256` of the exact payload bytes (which include a random
+salt, so the hash reveals nothing brute-forceable) — seals the event log,
+and only then pulls the image by digest and starts the container.
+Measure-before-launch is structural: the runtime refuses to start a
+container without the token that sealing returns. The provisioner gets a
+**receipt** (commitment + payload copy) — private, since it contains the
+payload.
+
+**Stage 2 — verify the running machine.** Anyone can challenge the VM
+again at any time (a fresh nonce each time; the evidence server outlives
+one-shot workloads). The quote now covers a nonzero PCR 13; replaying the
+event log yields the commitment. The receipt holder checks it equals
+`sha256` of the payload they sent — proving *their exact workload* is what
+was measured on that machine. Third parties see everything else (platform,
+base image, that *some* committed payload runs) but learn nothing about
+the workload itself.
+
+Lifecycle: the HPKE key, the latch, and PCR 13 all reset on reboot (PCRs
+are volatile; the key is in memory) — a rebooted VM is a *fresh* machine
+that must pass stage 1 again, and all old ciphertexts and evidence die
+with the old key.
+
+## How trust is rooted
+
+Verification rests on **two independent roots, cross-bound to the same VM
+and session**, plus one root you control:
+
+**The CPU vendor's hardware root.** TDX quotes chain to Intel (PCK
+certificate → Intel SGX Root CA); SEV-SNP reports chain to AMD's fused
+root keys (VCEK → ASK → ARK). Either signature is one the cloud operator
+cannot forge ([internal/verify/tee.go](internal/verify/tee.go) verifies
+both). A valid quote proves, with no Google involvement: this VM runs on
+genuine confidential hardware with encrypted memory; debug access is
+forbidden (a TDX `TD_ATTRIBUTES.DEBUG` bit or an SNP debug/migration
+policy is rejected outright); the initial guest was a specific firmware
+image (`MRTD` / `MEASUREMENT` — on GCE, Google's guest firmware, for
+which Google publishes signed endorsements in `gs://gce_tcb_integrity`,
+verifiable with
+[gce-tcb-verifier](https://github.com/google/gce-tcb-verifier); pin via
+`hardware.tdx.mrTd` / `hardware.snp.measurement`); and that the 64-byte
+`REPORT_DATA` — our transcript — was requested from inside this guest.
+
+**The technologies are not symmetric, and this is why TDX is the primary
+target.** TDX has four **runtime measurement registers (RTMRs)**: guest
+software extends them after launch, and they ride inside the Intel-signed
+quote. Calibrated on GCE (2026-10-07, see
+[nix/README.md](nix/README.md#tdx-calibration-2026-10-07)): the firmware
+and systemd-stub measure the boot chain into them, and **RTMR[2] is
+exactly the stub's section fold of our UKI in SHA-384** — kernel, initrd,
+and the cmdline that seals the dm-verity hash — predictable offline by
+`predict-measurements` and pinned via `-expected`. On TDX, base-image
+identity is therefore **Intel-rooted**. SNP has no runtime-extensible
+registers: its hardware measurement freezes at launch (covering Google's
+firmware only), so on SNP base-image identity rides entirely on the vTPM.
+
+**Google's platform root.** Google's GCE EK/AK CA (vendored in
+[internal/verify/roots.go](internal/verify/roots.go)) certifies the
+vTPM's attestation key, and the certificate names the exact GCE instance
+— something neither hardware quote carries. The AK signs the PCR quotes;
+the boot log and event log replay against them. On SNP this chain carries
+all software identity (PCR 4/11 base image, PCR 13 commitment). On TDX it
+contributes the instance identity, PCR 11 corroboration, and PCR 13 — the
+workload commitment still rides the vTPM today (moving it into the
+userspace-extendable RTMR[3] would put the workload, too, under the Intel
+root; it is the natural next step).
+
+**Where the vTPM actually runs — documented versus inferred.** Google
+does not document the vTPM's placement. What is documented:
+[Google's attestation docs](https://docs.cloud.google.com/confidential-computing/confidential-vm/docs/attestation)
+classify vTPM attestation as *software-based* and Google-managed (versus
+the *hardware-based* TSM), and the
+[firmware endorsements](https://docs.cloud.google.com/confidential-computing/confidential-vm/docs/verify-firmware)
+cover the UEFI binary only — significant because the SNP launch
+measurement is precisely the initial guest memory, so an in-guest vTPM
+would have to appear in it. Google's
+[2018 Shielded VM vTPM post](https://cloud.google.com/blog/products/identity-security/virtual-trusted-platform-module-for-shielded-vms-security-in-plaintext)
+describes the vTPM as protected *from the VM* by host paging, and
+Canonical began adding SVSM-vTPM (in-guest, VMPL0) support to GCE kernels
+in 2025 — implying the incumbent vTPM is not in-guest. Treat "host-side
+vTPM" as well-supported inference, not Google documentation; it is
+empirically testable via the SNP report's `VMPL` field (a guest reporting
+at VMPL0 leaves no room for a more-privileged in-guest vTPM).
+
+**Your own root.** The base image is reproducible from `flake.lock`:
+rebuild at the same commit, get the bit-identical UKI, predict the same
+PCR 11 / RTMR[2] golden values offline. You verify against numbers you
+derived, not numbers someone published.
+
+**The weld.** The transcript appears under both roots: the hardware signs
+it inside `REPORT_DATA`, and its inputs (the nonce, the AK) are the same
+ones the Google-rooted quote is verified against. Both chains therefore
+speak about the same VM, the same boot, the same challenge — and the
+encryption key inherits the hardware root: encrypting to the attested key
+means only software inside that genuine TD (or SNP guest) can read the
+payload.
+
+What that means per adversary — the honest TCB statement:
+
+| Adversary | Stopped by |
+|---|---|
+| Network attacker, other cloud tenants | Vendor-rooted quote + HPKE: can't forge evidence, can't read payloads. |
+| Anyone with GCE project/console access | Nothing to see: no workload config in metadata, evidence reveals only a salted hash. |
+| Google's hypervisor reading guest memory | TDX/SNP memory encryption (debug forbidden), proven by the vendor-signed quote. |
+| Google forging the *software identity* story | **TDX: largely stopped** — the base image is pinned by Intel-signed RTMRs; residual Google trust is the hardware-measured, published firmware binary that does the measuring (plus the vTPM for the PCR 13 commitment, until it moves to RTMR[3]). **SNP: not stopped** — the vTPM is Google software outside the launch measurement and carries all software identity. |
+
+The general ladder, useful for writing the claim down precisely: (1)
+trusting an *unmeasured, mutable Google service* — the SNP-era vTPM:
+operational, continuous, per-VM-targetable trust; (2) trusting a
+*hardware-identified, published Google binary* — the TDX firmware whose
+`MRTD` every verifier pins and whose bytes sit in a public bucket:
+static, auditable, and non-targetable, since subverting it means shipping
+the backdoor fleet-wide in the one endorsed image; (3) trusting *firmware
+you built from source* — bare metal. Rung 3 is never literally zero
+(CPU microcode, the AMD Secure Processor, Intel's TDX module remain
+vendor-signed); the achievable objective on rented hardware is rung 2 —
+every layer measured, pinned, published, and non-targetable — which is
+what the TDX path reaches today.
 
 ## 1. Build the measured image
 
@@ -72,172 +205,170 @@ Variants: `dev` has serial-console root autologin + tpm2-tools (for
 debugging/calibration — its PCRs differ from prod's, so a prod policy
 rejects dev images automatically); `prod` has no login path at all. Secure
 boot stays off by design: PCR pinning *detects* modified images, which is
-what remote attestation needs. The PCR 4/11 prediction models were
-calibrated against GCE firmware once (see
-[nix/README.md](nix/README.md#calibration-results)); recalibration is only
-needed if the image shape changes fundamentally.
+what remote attestation needs.
 
 Anyone can reproduce the image from a clean checkout at the same commit and
 compare `sha256sum uki.efi` — identical UKI means identical predicted PCRs
-(see [nix/README.md](nix/README.md) for the reproducibility procedure and
-its trust notes).
+(see [nix/README.md](nix/README.md) for the procedure and its trust notes).
+After changing Go sources or dependencies, resolve the launcher's
+`vendorHash` with `nix build .#launcher` (works on any machine, including
+macOS).
 
-## 2. Run your own container
+## 2. Boot a VM and provision your workload
 
-Any OCI image works, unmodified. **Always deploy by digest, not tag**:
-
-```bash
-deploy/create-instance.sh \
-  -i <image-name-from-step-1> \
-  -w registry.example.com/myapp@sha256:DIGEST \
-  [-c '["myapp","--flag"]'] [-e KEY=VALUE]... [-r Always|OnFailure|Never]
-```
-
-The VM boots the measured image; the launcher reads the workload from
-instance metadata (`tee-image-reference`, `tee-cmd`, `tee-env-*`,
-`tee-restart-policy`), pulls it, measures it into PCR 13, starts serving
-evidence on `:8080`, and only then starts the container. No SSH involved.
-Open the evidence port once per project:
-`gcloud compute firewall-rules create allow-attestation --allow tcp:8080`.
-
-### Getting your container's expected measurement
-
-What gets extended into PCR 13 is the canonical event log of the workload's
-identity; what a verifier pins in the policy is primarily the **manifest
-digest** of your image (the `sha256:...` after `@`). You do not need to
-precompute a PCR 13 value — the verifier replays the event log against the
-quoted PCR and checks the *claims*, which is what makes flexible policy
-(e.g. "this digest, any allowed env override") possible.
-
-The measured digest is exactly the digest of the reference you deploy, so
-obtaining it means asking your registry (for multi-arch images this is the
-index digest — also what containerd resolves):
+Any OCI image works, unmodified. The VM boots **bare** — no workload
+configuration anywhere in GCE metadata. The default is an Intel TDX
+instance (c3; pass `-t SEV_SNP` for an AMD n2d — same image, weaker
+trust chain per the previous section):
 
 ```bash
-# when pushing with docker (prints the digest at the end):
-docker buildx build --push -t registry.example.com/myapp:v1 .
-# or afterwards:
-docker inspect --format '{{index .RepoDigests 0}}' registry.example.com/myapp:v1
-
-# with crane or skopeo:
-crane digest registry.example.com/myapp:v1
-skopeo inspect --format '{{.Digest}}' docker://registry.example.com/myapp:v1
+deploy/create-instance.sh -i <image-name-from-step-1>
+gcloud compute firewall-rules create allow-attestation --allow tcp:8080  # once per project
 ```
 
-(No tools at all? A `HEAD` on
-`/v2/<repo>/manifests/<tag>` with an `Accept:
-application/vnd.oci.image.index.v1+json` header returns it in
-`docker-content-digest` — see the registry HTTP API.)
-
-Beyond the digest, the event log also records — and the verifier surfaces as
-claims — the resolved image reference, the image config digest ("image ID"),
-the final process args and env (after merging your image's ENTRYPOINT/CMD
-with any `-c` override), and every operator override *separately*, so your
-policy decides which overrides are acceptable. Deploying by tag instead of
-digest still measures faithfully (whatever the tag resolved to at launch),
-but then the digest in the evidence is chosen by the registry at boot time —
-pin digests.
-
-## 3. Write a policy and verify
-
-A policy states everything the relying party requires. Full reference
-(see also [examples/policy.yaml](examples/policy.yaml)):
+Describe your workload in a payload file (see
+[examples/payload.yaml](examples/payload.yaml)) — **always pin the image by
+digest**, and feel free to put secrets in `env`: the payload is encrypted
+end-to-end and never appears in public evidence.
 
 ```yaml
-# REQUIRED: the exact manifest digest of the workload (step 2).
-imageDigest: sha256:DIGEST
-
-# Optional: anchored regex the image reference must match.
-imageRefPattern: registry\.example\.com/myapp@sha256:.*
-
-# Optional: which env vars the operator may override (default: none).
-allowedEnvOverrides: [LOG_LEVEL]
-
-# Optional: whether the operator may override the command (default: false).
-allowArgOverrides: false
-
-# Optional but recommended: acceptable confidential technologies.
-# Omitting it accepts non-confidential VMs too.
-confidentialTechs: [AMD_SEV_SNP, INTEL_TDX]
-
-# Optional: pin the evidence to one VM (values come from the Google-issued
-# AK certificate; empty fields are not checked).
-# gceInstance: {projectId: my-project, zone: us-central1-a, instanceName: my-cvm}
-
-# Base-image pinning. Either write the values inline...
-# pcrs:
-#   bank: sha256
-#   values: {4: "<hex>", 11: "<hex>"}
-# ...or (preferred) pass -expected on the command line, which fills this
-# block from the build's expected-measurements.json.
-# (requireSecureBoot exists but is not used with measured images: the UKI is
-# unsigned and PCR pinning covers strictly more.)
+# payload.yaml
+image: registry.example.com/myapp@sha256:DIGEST
+cmd: ["myapp", "--flag"]        # optional
+env: { API_TOKEN: secret }      # optional
+restartPolicy: Never            # optional
 ```
 
-Then verify — one shot, from anywhere:
+Then provision — one command, from anywhere:
 
 ```bash
-go run ./cmd/verifier verify -host <VM_IP>:8080 \
-  -policy policy.yaml \
+go run ./cmd/verifier provision -host <VM_IP>:8080 \
+  -policy examples/policy.yaml \
+  -payload payload.yaml \
   -expected build-artifacts/<image-name>/expected-measurements.json
 ```
 
-This generates a fresh nonce, fetches evidence, verifies the full chain
-(steps 1–5 above), and evaluates the policy. Exit code 0 = pass; violations
-are listed with quoted-vs-expected values. `-json` gives machine-readable
-output. For auditable/offline flows, split it:
+This verifies the **fresh** VM first — full chain, PCR 13 still zero, and
+(per policy) a hardware report proving genuine SEV-SNP with the VM's
+encryption key bound into `REPORT_DATA` — and only then encrypts the
+payload to that key (HPKE, X25519 + ChaCha20-Poly1305) and POSTs it. The
+launcher decrypts, measures `sha256(payload)` into PCR 13, pulls the image,
+and starts the container.
+
+The command writes `receipt.json`: the commitment, the payload copy, and
+the instance identity. **The receipt is as secret as the payload** (it
+contains it); it is also your proof of *what* was provisioned.
+
+Notes on the flow:
+
+- The HPKE key lives only in launcher memory for one boot. A reboot or
+  launcher restart discards it — old evidence and old ciphertexts become
+  useless, and the VM waits fresh for provisioning again (nothing latches
+  across boots).
+- First valid payload wins. Anyone who can reach :8080 could race you for a
+  *fresh* VM (they cannot read or replace your payload once accepted), so
+  keep the firewall scoped to your verifier if that matters.
+- A second `POST /v1/workload` is rejected; garbage posts don't latch.
+
+## 3. Verify the running workload
+
+Whoever holds the receipt (or just the commitment) can verify:
 
 ```bash
-go run ./cmd/verifier nonce                                   # challenge
-go run ./cmd/verifier fetch -host <IP>:8080 -nonce N -out e.pb # collect
-go run ./cmd/verifier verify -evidence e.pb -nonce N -policy p.yaml -expected em.json
+go run ./cmd/verifier verify -host <VM_IP>:8080 \
+  -policy examples/policy.yaml \
+  -receipt receipt.json \
+  -expected build-artifacts/<image-name>/expected-measurements.json
 ```
 
-`cmd/dump-eventlog -evidence e.pb` prints the firmware event log behind
+Exit code 0 = pass; violations are listed with quoted-vs-expected values.
+`-json` gives machine-readable output. Third parties without the receipt
+can still verify everything up to the commitment — platform, hardware
+report, base image — and see *that* a committed payload runs; pass
+`-commitment HEX` if you choose to share the commitment itself. For
+auditable/offline flows, split it:
+
+```bash
+go run ./cmd/verifier nonce                                     # challenge
+go run ./cmd/verifier fetch -host <IP>:8080 -nonce N -out e.json # collect
+go run ./cmd/verifier verify -evidence e.json -nonce N -policy p.yaml -receipt receipt.json
+```
+
+The full policy reference is annotated in
+[examples/policy.yaml](examples/policy.yaml): `workloadCommitment`,
+`confidentialTechs` (Google-asserted), `hardware.require` +
+`hardware.snp.{productLine,measurement}` (AMD-rooted), `gceInstance`
+pinning, and `pcrs` base-image pinning (usually via `-expected`).
+`cmd/dump-eventlog -evidence e.json` prints the firmware event log behind
 PCR 4/11 when a pin mismatches and you need to see *why*.
 
 ## What verification proves — and what it doesn't
 
-Proves: this exact container image (by digest), with this exact runtime
-config, was measured by this exact base layer (launcher + OS, by PCR 4/11)
-into a Google-signed vTPM on that GCE instance, before the workload started,
-inside a VM whose boot chain and confidential technology replay correctly.
+Proves: a payload with this exact commitment — which the receipt holder can
+open to image digest, args, and env — was measured by this exact base layer
+(launcher + OS, by PCR 4/11) into a Google-signed vTPM on that GCE
+instance, before the workload started; the VM runs under genuine Intel
+TDX or AMD SEV-SNP (hardware-signed quote, debug forbidden) on Google's
+endorsed firmware — on TDX with the base image additionally pinned by the
+Intel-signed RTMRs; and the payload was encrypted so that only that
+verified VM could read it.
 
-Does not prove: workload behavior after launch; transport privacy of the
-evidence port (evidence is public-verifiable; add TLS/proxy if you care);
-registry trust beyond the digest (pin digests, and remember `/var` —
-containerd's cache — is deliberately outside the measurement, anchored
-instead by the digest check in PCR 13); and the whole story trusts Google
-(vTPM + CA) — hardware-rooted reports are the main phase-2 item.
+Does not prove: workload behavior after launch; that the *container image
+contents* behind the pinned digest are what you think (pin digests you
+trust; `/var` — containerd's cache — is deliberately outside the
+measurement, anchored by the digest in the payload); who else knows the
+payload (anyone holding the receipt); and anything Google-forgeable — see
+the adversary table in [How trust is rooted](#how-trust-is-rooted) for the
+exact boundary between the hardware-proven and Google-vouched halves.
+
+## Beyond GCE: bare metal
+
+The protocol is anchor-agnostic; only trust anchors are configuration. On
+your own SEV-SNP host, `/dev/sev-guest` and the AMD root chain work
+identically (set `hardware.snp.measurement` to *your* OVMF's launch
+measurement instead of Google's). A bare-metal TDX host additionally needs
+Intel quote-generation infrastructure (QGS/DCAP) beside the guest; the
+verifier side is the same code. For the TPM side, point the verifier at
+your AK with `-trusted-ak-pub` (physical-TPM EK certificate chains are
+future work), and calibrate PCR/RTMR values for your own firmware with
+`cmd/predict-measurements` and `cmd/dump-eventlog` after a first boot.
 
 ## Development without a CVM
 
-`go test ./...` runs the full measure → attest → verify roundtrip against a
-bundled TPM simulator, including tamper cases. The launcher's
-`-ak owner-ecc` and verifier's `-trusted-ak-pub` support the same dev mode
-on any machine with a TPM — with no anchor to Google, so it proves nothing
-about where the code runs. The launcher also still runs on a stock Ubuntu
-CVM (`-spec`/`-image` flags, containerd required) — useful for iteration,
-but without the measured base layer, PCR 4/11 pinning does not apply and the
-launcher itself is unattested.
+`go test ./...` runs the full provision → measure → attest → verify
+roundtrip against a bundled TPM simulator and a fake, test-rooted SEV-SNP
+device, plus Intel-signed TDX quote fixtures — including tamper cases
+(debug-bit reports and TDs, substituted keys, cross-VM ciphertexts, stale
+evidence). The launcher's `-ak owner-ecc` and
+verifier's `-trusted-ak-pub` support the same dev mode on any machine with
+a TPM; `-spec file.yaml` skips encrypted provisioning entirely (the payload
+comes from the file, commitment-measured the same way).
 
 ## Layout
 
 - [cmd/launcher](cmd/launcher/main.go) — runs on the CVM
-- [cmd/verifier](cmd/verifier/main.go) — runs anywhere; no CGO
-- [cmd/predict-measurements](cmd/predict-measurements/main.go) — golden PCR 4/11 from a UKI
-- [cmd/dump-eventlog](cmd/dump-eventlog/main.go) — firmware event-log inspection for calibration/debugging
+- [cmd/verifier](cmd/verifier/main.go) — runs anywhere; provisions and verifies
+- [cmd/predict-measurements](cmd/predict-measurements/main.go) — golden PCR 4/11 + RTMR[2] values from a UKI
+- [cmd/dump-eventlog](cmd/dump-eventlog/main.go) — firmware event-log + TDX RTMR inspection
+- [internal/provision](internal/provision/provision.go) — transcript, HPKE seal/open, payload commitment
 - [internal/measure](internal/measure/measure.go) — CEL construction + PCR 13 extension
-- [internal/attestor](internal/attestor/attestor.go) — AK ownership, quotes, HTTP evidence server
-- [internal/runtime](internal/runtime/containerd.go) — containerd pull/create/run (digest + final OCI spec come from the same objects that execute)
-- [internal/verify](internal/verify/verify.go) — verification pipeline, [policy](internal/verify/policy.go), [trust roots](internal/verify/roots.go)
+- [internal/attestor](internal/attestor/attestor.go) — AK + TEE device ownership, quotes, HTTP evidence server
+- [internal/runtime](internal/runtime/containerd.go) — containerd pull/create/run
+- [internal/verify](internal/verify/verify.go) — verification pipeline, [hardware report](internal/verify/tee.go), [policy](internal/verify/policy.go), [trust roots](internal/verify/roots.go)
 - [flake.nix](flake.nix) + [nix/](nix/README.md) — the measured image (build internals, calibration results, reproducibility)
 - [image/](image/README.md) — earlier mkosi-based image (superseded by the NixOS image)
 
-## Phase 2 ideas
+## Phase 3 ideas
 
-- Bind SEV-SNP / TDX hardware reports (`client.AttestOpts.TEEDevice`) so
-  trust roots in AMD/Intel rather than only Google.
-- Attestation-gated secret release (verify-then-release KBS flow).
-- Registry auth for private images.
-- Terraform module / multi-instance orchestration.
+- Measure the workload commitment into RTMR[3] (userspace register), so
+  the workload — not just the base image — sits under the Intel root.
+- Reconstruct RTMR[0]/[1] from the CCEL
+  (`/sys/firmware/acpi/tables/data/CCEL`) and check their cross-boot
+  stability; today only RTMR[2] is predicted and pinned.
+- TDX TCB-status collateral checking at verify time (Intel PCS) and
+  automated Google firmware-endorsement fetching (gce-tcb-verifier).
+- Empirically settle the SNP vTPM placement via the report VMPL field.
+- Provisioner authentication (pin a provisioner public key at instance
+  creation, recorded in the CEL).
+- Bare-metal TPM EK-manufacturer certificate chains; registry auth for
+  private images.
