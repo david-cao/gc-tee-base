@@ -122,6 +122,49 @@ identity is therefore **Intel-rooted**. SNP has no runtime-extensible
 registers: its hardware measurement freezes at launch (covering Google's
 firmware only), so on SNP base-image identity rides entirely on the vTPM.
 
+**What the measurements cover.** Neither launch measurement ever covers
+the image you deploy: `MRTD` and SNP's `MEASUREMENT` are digests of the
+*initial* guest (Google's firmware; for SNP also the initial vCPU state,
+which is why endorsements are per vCPU count). On SNP that is the whole
+story — your image appears nowhere in the AMD attestation; the only
+guest-influenced report field is `REPORT_DATA`, a per-report value, not a
+code measurement. On TDX your image enters the hardware attestation
+through the RTMRs, as a measured-boot delegation chain: Google's firmware
+(measured as `MRTD`) extends RTMR[0] with its configuration and RTMR[1]
+with what it loads — including the authentihash of your UKI — and then
+the systemd-stub *inside your UKI* (measured into RTMR[1]) extends
+RTMR[2] with the sections it is about to execute. Each measuring agent is
+measured by the previous one; only the first link is measured by silicon.
+
+**Where the hardware guarantee ends.** Be precise about what Intel
+enforces: the TDX module attests that *a TD whose initial contents
+measured `MRTD=X` issued these RTMR extensions*. An extend records
+whatever digest the caller supplies — the hardware does not check that it
+corresponds to code actually loaded or run, and RTMRs are not privilege-
+protected inside the TD. A malicious firmware could therefore extend
+RTMR[1] *and* RTMR[2] with the expected golden values and boot something
+else entirely; nothing above `MRTD` is hardware-enforced, only
+hardware-*attributed*. The truthfulness of the RTMRs is a conditional
+claim — *if the binary measuring `MRTD=X` faithfully measures before
+executing, then the RTMRs reflect the real boot chain* — and the
+condition names the one component the silicon itself measures. That
+forces a lying Google into one of two moves: run a different firmware
+(the `MRTD` pin fails closed), or put the lie inside the pinned binary —
+the single published, endorsed, fleet-wide artifact anyone can hash,
+archive, and reverse-engineer, making the attack non-targetable and
+permanently attributable. Contrast SNP, where the lying component (the
+vTPM) is unmeasured: forging one tenant's evidence changes no
+measurement, ships no artifact, and leaves no trace.
+
+**Corollary: pin the exact `MRTD`, not endorsement validity.** Google can
+mint a signed endorsement for any build it ships — including a backdoored
+one — so "this `MRTD` has a valid Google endorsement" only proves
+*genuine Google firmware*, which is precisely the property the attack
+above abuses. Pinning one specific value (ideally a build the whole fleet
+has been running) is what forces a lie into the published artifact.
+`hardware.tdx.mrTd` is an exact pin for this reason; use the endorsement
+to *choose* the value, not as the check itself.
+
 **Google's platform root.** Google's GCE EK/AK CA (vendored in
 [internal/verify/roots.go](internal/verify/roots.go)) certifies the
 vTPM's attestation key, and the certificate names the exact GCE instance
@@ -170,7 +213,7 @@ What that means per adversary — the honest TCB statement:
 | Network attacker, other cloud tenants | Vendor-rooted quote + HPKE: can't forge evidence, can't read payloads. |
 | Anyone with GCE project/console access | Nothing to see: no workload config in metadata, evidence reveals only a salted hash. |
 | Google's hypervisor reading guest memory | TDX/SNP memory encryption (debug forbidden), proven by the vendor-signed quote. |
-| Google forging the *software identity* story | **TDX: largely stopped** — the base image is pinned by Intel-signed RTMRs; residual Google trust is the hardware-measured, published firmware binary that does the measuring (plus the vTPM for the PCR 13 commitment, until it moves to RTMR[3]). **SNP: not stopped** — the vTPM is Google software outside the launch measurement and carries all software identity. |
+| Google forging the *software identity* story | **TDX: reduced to the firmware condition** — the base image is pinned by Intel-signed RTMRs, whose truthfulness rests on the one binary the silicon measures (see "Where the hardware guarantee ends"): a lie requires either a changed `MRTD` (fails closed) or a backdoor in the published fleet-wide firmware (non-targetable, attributable). The vTPM still carries the PCR 13 commitment, until it moves to RTMR[3]; PCR 11 cross-checks RTMR[2] through an independent (also Google-run) path. **SNP: not stopped** — the vTPM is Google software outside the launch measurement, carries all software identity, and can lie per-VM without artifact or trace. |
 
 The general ladder, useful for writing the claim down precisely: (1)
 trusting an *unmeasured, mutable Google service* — the SNP-era vTPM:

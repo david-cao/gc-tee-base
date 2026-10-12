@@ -31,9 +31,13 @@ confidentialTechs:
 hardware:
   require: true
   tdx:
-    # Optional: pin MRTD (96 hex chars) — the launch measurement of
-    # Google's TD firmware. Obtain it from a calibration run or Google's
-    # signed endorsement (gs://gce_tcb_integrity; see README).
+    # Recommended: pin the EXACT MRTD (96 hex chars) — the launch
+    # measurement of Google's TD firmware, from a calibration run. Use
+    # Google's signed endorsement (gs://gce_tcb_integrity) to vet the
+    # value, not as the check itself: an endorsement only proves "genuine
+    # Google firmware", and the RTMRs are only as truthful as the specific
+    # firmware binary this pins (see README, "Where the hardware
+    # guarantee ends").
     # mrTd: <96 hex chars>
     # Optional: pin RTMRs. RTMR[2] is the Intel-rooted pin of the exact
     # base image (UKI section fold, sha384) — normally filled from the
